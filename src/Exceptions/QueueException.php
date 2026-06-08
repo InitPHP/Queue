@@ -1,21 +1,19 @@
 <?php
-/**
- * InitPHP Queue
- *
- * This file is part of InitPHP Queue.
- *
- * @author      Muhammet ŞAFAK <info@muhammetsafak.com.tr>
- * @copyright   Copyright © 2023 Muhammet ŞAFAK
- * @license     ./LICENSE  MIT
- * @version     1.0
- * @link        https://www.muhammetsafak.com.tr
- */
 
 declare(strict_types=1);
+
 namespace InitPHP\Queue\Exceptions;
 
-use Exception;
+use BabelQueue\Exceptions\BabelQueueException;
 
-class QueueException extends Exception
+/**
+ * Base exception for every error raised by the InitPHP Queue runtime.
+ *
+ * It extends {@see BabelQueueException} so a single `catch (BabelQueueException)`
+ * captures both the envelope/codec errors thrown by the underlying
+ * `babelqueue/php-sdk` and the runtime (worker, transport, routing) errors
+ * thrown here.
+ */
+class QueueException extends BabelQueueException
 {
 }

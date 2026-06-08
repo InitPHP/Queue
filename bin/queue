@@ -1,0 +1,25 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use InitPHP\Queue\Console\WorkerCommand;
+
+exit((static function (array $argv): int {
+    $autoloads = [
+        __DIR__ . '/../../../autoload.php', // installed as a dependency (vendor/initphp/queue/bin)
+        __DIR__ . '/../vendor/autoload.php', // running from the package checkout
+    ];
+
+    foreach ($autoloads as $autoload) {
+        if (is_file($autoload)) {
+            require $autoload;
+
+            return (new WorkerCommand())->run($argv);
+        }
+    }
+
+    fwrite(STDERR, 'error: could not locate the Composer autoloader. Run "composer install".' . PHP_EOL);
+
+    return 1;
+})($argv));
