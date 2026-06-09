@@ -82,10 +82,7 @@
         "ci": "Run the full local CI bundle: cs-check, stan, test."
     },
     "config": {
-        "sort-packages": true,
-        "allow-plugins": {
-            "infection/extension-installer": false
-        }
+        "sort-packages": true
     },
     "minimum-stability": "stable",
     "prefer-stable": true,
