@@ -45,3 +45,12 @@ Bugs from `1.x` that no longer exist in the new design:
   and **RabbitMQ** (AMQP), each paired with the SDK's publish side.
 - A thin `Producer` facade over `EnvelopeCodec` + a `Transport`.
 - A `bin/queue` CLI worker entry point.
+- **Opt-in idempotent consumption.** A new `IdempotencyStore` contract
+  (`Contracts/IdempotencyStore.php`) with an in-memory reference implementation
+  (`InMemoryIdempotencyStore`) lets the `Dispatcher` dedupe at-least-once
+  redeliveries, processing a message **at most once**. Enable it by passing an
+  `IdempotencyOptions` to the `Dispatcher`; the dedup key derives from a custom
+  resolver, the envelope's `meta.id`, or its `trace_id`, and is recorded only
+  after a handler succeeds (a throwing handler stays retryable). Disabled by
+  default — existing behaviour is unchanged. Bring a durable, atomic store
+  (Redis/PDO) for fleet-wide deduplication; see the README.
