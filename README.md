@@ -1,5 +1,6 @@
 # InitPHP Queue
 
+[![Designed & Maintained with Tan](https://www.muhammetsafak.com.tr/badges/designed-maintained-with-tan.svg)](https://www.muhammetsafak.com.tr/en/tan/)
 [![CI](https://github.com/InitPHP/Queue/actions/workflows/ci.yml/badge.svg)](https://github.com/InitPHP/Queue/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![PHP Version](https://img.shields.io/badge/php-%E2%89%A5%208.2-777bb4.svg)](composer.json)
