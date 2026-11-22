@@ -24,8 +24,7 @@ final class Producer
     public function __construct(
         private readonly Transport $transport,
         private readonly string $defaultQueue = 'default',
-    ) {
-    }
+    ) {}
 
     /**
      * Publish a {@see PolyglotJob}. Its URN and payload come from the job; an

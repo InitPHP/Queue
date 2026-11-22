@@ -26,7 +26,7 @@ final class WorkerResilienceTest extends TestCase
     public function test_a_reserve_error_is_logged_and_the_loop_keeps_going(): void
     {
         $events = [];
-        $transport = new class () implements ConsumerTransport {
+        $transport = new class implements ConsumerTransport {
             public int $reserveCalls = 0;
 
             public function reserve(string $queue, float $timeout = 5.0): ?ReceivedMessage
@@ -39,17 +39,11 @@ final class WorkerResilienceTest extends TestCase
                 return null;
             }
 
-            public function ack(ReceivedMessage $message): void
-            {
-            }
+            public function ack(ReceivedMessage $message): void {}
 
-            public function release(ReceivedMessage $message, string $payload, int $delaySeconds = 0): void
-            {
-            }
+            public function release(ReceivedMessage $message, string $payload, int $delaySeconds = 0): void {}
 
-            public function deadLetter(ReceivedMessage $message, string $payload): void
-            {
-            }
+            public function deadLetter(ReceivedMessage $message, string $payload): void {}
         };
 
         $worker = new Worker(
@@ -74,9 +68,7 @@ final class WorkerResilienceTest extends TestCase
         $transport = new class ($this->envelope()) implements ConsumerTransport {
             private bool $served = false;
 
-            public function __construct(private readonly string $raw)
-            {
-            }
+            public function __construct(private readonly string $raw) {}
 
             public function reserve(string $queue, float $timeout = 5.0): ?ReceivedMessage
             {
@@ -93,13 +85,9 @@ final class WorkerResilienceTest extends TestCase
                 throw new RuntimeException('ack failed');
             }
 
-            public function release(ReceivedMessage $message, string $payload, int $delaySeconds = 0): void
-            {
-            }
+            public function release(ReceivedMessage $message, string $payload, int $delaySeconds = 0): void {}
 
-            public function deadLetter(ReceivedMessage $message, string $payload): void
-            {
-            }
+            public function deadLetter(ReceivedMessage $message, string $payload): void {}
         };
 
         $worker = new Worker(

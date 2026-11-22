@@ -97,7 +97,7 @@ final class InMemoryRedis implements ClientInterface
 
         $matching = array_filter(
             $this->zsets[$key] ?? [],
-            static fn (float $score): bool => $score >= $low && $score <= $high,
+            static fn(float $score): bool => $score >= $low && $score <= $high,
         );
         asort($matching);
 

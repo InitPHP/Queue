@@ -12,6 +12,4 @@ namespace InitPHP\Queue\Exceptions;
  * These are bugs to fix in code, not transient runtime failures, so they are
  * never retried or dead-lettered — they surface immediately.
  */
-final class ConfigurationException extends QueueException
-{
-}
+final class ConfigurationException extends QueueException {}

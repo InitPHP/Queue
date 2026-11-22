@@ -15,9 +15,7 @@ final class ThrowingHandler implements Handler
 {
     public int $calls = 0;
 
-    public function __construct(private readonly string $message = 'handler failed')
-    {
-    }
+    public function __construct(private readonly string $message = 'handler failed') {}
 
     public function handle(InboundMessage $message): void
     {

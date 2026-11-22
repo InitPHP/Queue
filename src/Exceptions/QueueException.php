@@ -14,6 +14,4 @@ use BabelQueue\Exceptions\BabelQueueException;
  * `babelqueue/php-sdk` and the runtime (worker, transport, routing) errors
  * thrown here.
  */
-class QueueException extends BabelQueueException
-{
-}
+class QueueException extends BabelQueueException {}

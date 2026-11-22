@@ -31,8 +31,7 @@ final class ReceivedMessage implements InboundMessage
         private readonly string $rawBody,
         private readonly array $envelope,
         private readonly mixed $receipt,
-    ) {
-    }
+    ) {}
 
     /**
      * The message URN — its language-agnostic identity. Accepts the inbound

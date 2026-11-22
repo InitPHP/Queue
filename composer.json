@@ -40,7 +40,7 @@
         "mockery/mockery": "^1.6",
         "predis/predis": "^2.2",
         "php-amqplib/php-amqplib": "^3.5",
-        "friendsofphp/php-cs-fixer": "^3.65"
+        "friendsofphp/php-cs-fixer": "^3.88"
     },
     "suggest": {
         "ext-pdo": "Required by the PDO (database-backed) transport.",
