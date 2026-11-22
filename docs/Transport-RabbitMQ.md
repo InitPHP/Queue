@@ -1,12 +1,14 @@
-# RabbitMQ (AMQP) transport
+# Transport: RabbitMQ (AMQP)
 
 `InitPHP\Queue\Transport\Amqp\AmqpTransport` runs the queue on RabbitMQ.
 Publishing reuses the SDK's `BabelQueue\Transport\AmqpTransport` (durable queue,
 persistent message, the contract AMQP properties and headers); consuming adds a
 pull-based loop.
 
-Requires [`php-amqplib/php-amqplib`](https://packagist.org/packages/php-amqplib/php-amqplib)
-(and `ext-sockets`).
+**Requires** [`php-amqplib/php-amqplib`](https://packagist.org/packages/php-amqplib/php-amqplib)
+and `ext-sockets`.
+
+## Construction
 
 ```php
 use InitPHP\Queue\Transport\Amqp\AmqpTransport;
@@ -22,7 +24,7 @@ $transport = new AmqpTransport(
 );
 ```
 
-Close the connection and channel when your producer or worker shuts down.
+Close the channel and connection when your producer or worker shuts down.
 
 ## Wire mapping
 
@@ -48,7 +50,7 @@ auto_delete=false`); the body is the canonical envelope JSON.
 | Operation | AMQP action |
 | --------- | ----------- |
 | `publish()` | Declare the queue, `basic_publish` the persistent envelope. |
-| `reserve()` | Declare the queue, then `basic_get` one message (pull). Returns `null` when the queue is empty. |
+| `reserve()` | Declare the queue, then `basic_get` one message (pull). Returns `null` when empty. |
 | `ack()` | `basic_ack` on the delivery tag. |
 | `release()` | `basic_ack` the original, then **republish** the updated envelope. |
 | `deadLetter()` | `basic_ack` the original, then publish the annotated envelope to `<queue>.failed`. |
@@ -68,8 +70,8 @@ and dead-letter annotations accurate across redeliveries.
 delay is not applied on RabbitMQ** — retries are republished immediately — because
 native delayed delivery requires the
 [delayed-message-exchange plugin](https://github.com/rabbitmq/rabbitmq-delayed-message-exchange).
-If you need back-off windows on RabbitMQ, install that plugin and route the failed
-exchange accordingly, or use the PDO/Redis transport where delays are honoured
+If you need back-off windows, install that plugin, or use the
+[PDO](Transport-PDO.md)/[Redis](Transport-Redis.md) transport where delays are honoured
 natively.
 
 ## Operational notes
@@ -81,5 +83,5 @@ natively.
 - **Connections are not thread-safe.** Use one connection/channel per worker
   process.
 
-See [The worker & retries](../worker-and-retries.md) and
-[Dead-letter handling](../dead-letter.md) for the policy that drives these calls.
+See [The Worker](The-Worker.md) and [Retries & Dead-Letters](Retries-and-Dead-Letters.md)
+for the policy that drives these calls.
