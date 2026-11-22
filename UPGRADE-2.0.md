@@ -39,4 +39,4 @@ orphaned any failed job already on the queue. `2.0` serialises the
 
 The `2.0` PDO transport stores the full canonical envelope as JSON rather than a
 column per field, so it no longer depends on column order. The new schema and a
-migration note ship in [`docs/transports/pdo.md`](docs/transports/pdo.md).
+migration note ship in [`docs/Transport-PDO.md`](docs/Transport-PDO.md).

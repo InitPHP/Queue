@@ -1,9 +1,11 @@
-# PDO (database) transport
+# Transport: PDO (Database)
 
 `InitPHP\Queue\Transport\Pdo\PdoTransport` is a database-backed transport — the
 one the core SDK does not ship. It needs no broker process: jobs live in two
 tables. It is the simplest way to add a durable queue to an app that already has a
 database, and it works on **MySQL** and **SQLite**.
+
+## Construction
 
 ```php
 use InitPHP\Queue\Transport\Pdo\PdoTransport;
@@ -19,19 +21,19 @@ $transport = new PdoTransport(
 );
 ```
 
-PHP 8 puts PDO in exception error mode by default; keep it that way so failures
+PHP 8 puts PDO in exception error mode by default — keep it that way so failures
 surface instead of being swallowed.
 
 ## Tables
 
-For development and tests, let the transport create the tables:
+For development and tests, let the transport create the tables (idempotent):
 
 ```php
-$transport->createSchema();   // CREATE TABLE IF NOT EXISTS … (idempotent)
+$transport->createSchema();
 ```
 
 In production you usually own your migrations. The DDL below is what
-`createSchema()` produces on MySQL — create it through your migration tool:
+`createSchema()` produces on MySQL:
 
 ```sql
 CREATE TABLE IF NOT EXISTS jobs (
@@ -60,10 +62,13 @@ CREATE TABLE IF NOT EXISTS jobs_failed (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ```
 
+> On SQLite the reservation index is created as a separate `CREATE INDEX`
+> statement; the column types are otherwise the same.
+
 ### Columns
 
-The full envelope is stored as JSON in `payload`; `queue`, `urn`, `trace_id` and
-`attempts` are denormalised into columns only for indexing and inspection.
+The full envelope is stored as JSON in `payload`; the other columns are
+denormalised from it for indexing and inspection.
 
 | Column | Purpose |
 | ------ | ------- |
@@ -77,16 +82,16 @@ The full envelope is stored as JSON in `payload`; `queue`, `urn`, `trace_id` and
 | `created_at` | Insert time. |
 
 > The table name is validated as a bare SQL identifier (letters, digits,
-> underscores) to keep it safe to interpolate; anything else raises a
-> `ConfigurationException`.
+> underscores); anything else raises `ConfigurationException`. This keeps it safe
+> to interpolate into the queries.
 
 ## How reservation works
 
-`reserve()` uses a **portable optimistic claim** that is correct on MySQL and
-SQLite alike, without `SELECT … FOR UPDATE SKIP LOCKED`:
+`reserve()` uses a **portable optimistic claim**, correct on MySQL and SQLite
+alike, without `SELECT … FOR UPDATE SKIP LOCKED`:
 
-1. `SELECT` the oldest row for the queue that is ready
-   (`available_at <= now` and not currently reserved).
+1. `SELECT` the oldest ready row for the queue (`available_at <= now`, not
+   currently reserved).
 2. `UPDATE … SET reserved_at = now WHERE id = ? AND (reserved_at IS NULL OR reserved_at <= :stale)`.
 3. If exactly one row was affected, the claim succeeded; otherwise another worker
    won it, so try the next row.
@@ -97,28 +102,27 @@ This guarantees two workers never run the same job.
 
 A row reserved by a worker that then crashes would otherwise be stuck forever. Any
 reservation older than `retryAfter` seconds (default 90) is treated as abandoned
-and becomes reservable again — so no message is lost. Set it comfortably above
-your slowest handler's runtime.
+and becomes reservable again, so no message is lost. Set it comfortably above your
+slowest handler's runtime.
 
-## Lifecycle, in SQL terms
+## Lifecycle in SQL terms
 
 | Operation | Effect |
 | --------- | ------ |
-| `publish()` | `INSERT` a ready row; returns the new row id. |
-| `reserve()` | The optimistic claim above. |
+| `publish()` | `INSERT` a ready row; returns the new row id as a string. |
+| `reserve()` | The optimistic claim above; returns a `ReceivedMessage` or `null`. |
 | `ack()` | `DELETE` the row. |
 | `release()` | `UPDATE` the row with the new payload/attempts and `available_at = now + delay`, clearing `reserved_at`. |
 | `deadLetter()` | In one transaction: `INSERT` into the failed table, then `DELETE` the row. |
 
 ## Operational notes
 
-- **Polling.** PDO reservation is a poll: when the queue is empty, `reserve()`
-  returns immediately and the worker sleeps for `WorkerOptions::$sleepWhenEmpty`.
-  Tune that for your latency/load trade-off.
+- **Polling.** Reservation is a poll: on an empty queue `reserve()` returns
+  immediately and the worker sleeps for `WorkerOptions::$sleepWhenEmpty`.
 - **Indexing.** The `(queue, available_at, reserved_at)` index keeps reservation
-  fast as the table grows; keep it.
+  fast as the table grows — keep it.
 - **Housekeeping.** `ack()` deletes rows, so the main table stays small. Prune the
   `*_failed` table on your own schedule once messages are reviewed or replayed.
 
-See [Dead-letter handling](../dead-letter.md) for inspecting and replaying failed
-rows.
+See [Retries & Dead-Letters](Retries-and-Dead-Letters.md) for inspecting and
+replaying failed rows.

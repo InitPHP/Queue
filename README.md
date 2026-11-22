@@ -275,25 +275,25 @@ A malformed or unsupported-`schema_version` envelope is always **quarantined**
 
 ## Documentation
 
-Full guides live in [`docs/`](docs/):
+Full guides live in [`docs/`](docs/Home.md):
 
 | Guide | What it covers |
 | ----- | -------------- |
-| [Getting started](docs/getting-started.md) | Install, the three moving parts, your first producer + worker. |
-| [Envelope & URNs](docs/envelope-and-urns.md) | The wire format and how to name message URNs. |
-| [Handlers & routing](docs/handlers-and-routing.md) | Writing handlers, the `HandlerMap`, unknown-URN strategies. |
-| [The worker & retries](docs/worker-and-retries.md) | The loop, `WorkerOptions`, back-off, limits, graceful shutdown, the CLI. |
-| [Dead-letter handling](docs/dead-letter.md) | When messages are quarantined and how to inspect/replay them. |
-| [PDO transport](docs/transports/pdo.md) | Schema, production DDL, reservation semantics. |
-| [Redis transport](docs/transports/redis.md) | Keys, the reliable-queue pattern, delayed retries. |
-| [RabbitMQ transport](docs/transports/amqp.md) | Properties, headers, retry/delay caveats. |
-| [Interoperability](docs/interoperability.md) | Consuming a Go/Python-produced message end to end. |
-| [Migrating from 1.x](docs/migrating-from-v1.md) | What changed and how to port `1.x` jobs. |
+| [Getting started](docs/Quick-Start.md) | Install, the three moving parts, your first producer + worker. |
+| [Envelope & URNs](docs/The-Message-Envelope.md) | The wire format and how to name message URNs. |
+| [Handlers & routing](docs/Handlers-and-Routing.md) | Writing handlers, the `HandlerMap`, unknown-URN strategies. |
+| [The worker & retries](docs/The-Worker.md) | The loop, `WorkerOptions`, back-off, limits, graceful shutdown, the CLI. |
+| [Dead-letter handling](docs/Retries-and-Dead-Letters.md) | When messages are quarantined and how to inspect/replay them. |
+| [PDO transport](docs/Transport-PDO.md) | Schema, production DDL, reservation semantics. |
+| [Redis transport](docs/Transport-Redis.md) | Keys, the reliable-queue pattern, delayed retries. |
+| [RabbitMQ transport](docs/Transport-RabbitMQ.md) | Properties, headers, retry/delay caveats. |
+| [Interoperability](docs/Interoperability.md) | Consuming a Go/Python-produced message end to end. |
+| [Migrating from 1.x](docs/Migration-from-1.x.md) | What changed and how to port `1.x` jobs. |
 
 ## Migrating from 1.x
 
 `2.0` is a breaking rewrite. See [UPGRADE-2.0.md](UPGRADE-2.0.md) and
-[docs/migrating-from-v1.md](docs/migrating-from-v1.md).
+[docs/Migration-from-1.x.md](docs/Migration-from-1.x.md).
 
 ## Testing
 
