@@ -143,7 +143,7 @@ final class DispatcherIdempotencyTest extends TestCase
         $map = (new HandlerMap())->register(self::URN, $handler);
         $options = new IdempotencyOptions(
             $store,
-            keyResolver: static fn (ReceivedMessage $m): string => (string) ($m->getData()['order_id'] ?? ''),
+            keyResolver: static fn(ReceivedMessage $m): string => (string) ($m->getData()['order_id'] ?? ''),
         );
         $dispatcher = new Dispatcher($map, idempotency: $options);
 

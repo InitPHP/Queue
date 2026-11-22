@@ -103,7 +103,7 @@ final class HandlerMapTest extends TestCase
 
     public function test_a_concrete_handler_can_be_used_via_resolver(): void
     {
-        $handler = new class () implements Handler {
+        $handler = new class implements Handler {
             public bool $ran = false;
 
             public function handle(InboundMessage $message): void

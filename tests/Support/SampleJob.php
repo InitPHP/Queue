@@ -22,8 +22,7 @@ final class SampleJob implements PolyglotJob, HasTraceId
         private readonly string $urn = 'urn:babel:orders:created',
         private readonly array $payload = ['order_id' => 1042],
         private readonly ?string $traceId = null,
-    ) {
-    }
+    ) {}
 
     public function getBabelUrn(): string
     {

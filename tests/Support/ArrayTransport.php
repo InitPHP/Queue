@@ -33,9 +33,7 @@ final class ArrayTransport implements Transport, ConsumerTransport
 
     private int $receiptSeq = 0;
 
-    public function __construct(private readonly string $defaultQueue = 'default')
-    {
-    }
+    public function __construct(private readonly string $defaultQueue = 'default') {}
 
     public function publish(string $payload, ?string $queue = null): ?string
     {

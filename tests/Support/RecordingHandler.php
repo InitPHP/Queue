@@ -25,6 +25,6 @@ final class RecordingHandler implements Handler
      */
     public function payloads(): array
     {
-        return array_map(static fn (InboundMessage $m): array => $m->getData(), $this->handled);
+        return array_map(static fn(InboundMessage $m): array => $m->getData(), $this->handled);
     }
 }

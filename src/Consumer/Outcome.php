@@ -22,8 +22,7 @@ final class Outcome
         public readonly OutcomeKind $kind,
         public readonly string $reason = '',
         public readonly ?Throwable $exception = null,
-    ) {
-    }
+    ) {}
 
     /** Handled successfully. */
     public static function ack(): self
