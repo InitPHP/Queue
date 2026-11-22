@@ -173,7 +173,7 @@ final class PdoTransport implements Transport, ConsumerTransport
     /**
      * Create the main and dead-letter tables (and the reservation index) if they
      * do not exist. A convenience for getting started and for tests; production
-     * deployments usually own their migrations — see docs/transports/pdo.md.
+     * deployments usually own their migrations — see docs/Transport-PDO.md.
      */
     public function createSchema(): void
     {

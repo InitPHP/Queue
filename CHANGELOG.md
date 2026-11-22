@@ -4,9 +4,9 @@ All notable changes to `initphp/queue` are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.2.0] - 2026-11-22
 
-### Changed (breaking)
+### Changed
 
 - Code style moved to PER-CS (php-cs-fixer, shared `.php-cs-fixer.dist.php`,
   replacing the previous PSR-12 configuration); the codebase has been
