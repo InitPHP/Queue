@@ -102,8 +102,14 @@ This guarantees two workers never run the same job.
 
 A row reserved by a worker that then crashes would otherwise be stuck forever. Any
 reservation older than `retryAfter` seconds (default 90) is treated as abandoned
-and becomes reservable again, so no message is lost. Set it comfortably above your
-slowest handler's runtime.
+and becomes reservable again, so the message is delivered again (at-least-once)
+instead of staying stuck. Set it comfortably above your slowest handler's runtime.
+
+If you also enable the dispatcher's [deduplication](Idempotent-Consumption.md),
+keep its `leaseSeconds` **below** `retryAfter`: with the defaults (`retryAfter` 90,
+`leaseSeconds` 300) the redelivery of a dead worker's message arrives while its
+claim is still held, and it is discarded as a duplicate — see
+[Idempotent Consumption](Idempotent-Consumption.md#choosing-leaseseconds).
 
 ## Lifecycle in SQL terms
 

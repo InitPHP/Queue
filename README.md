@@ -158,15 +158,16 @@ new WorkerOptions(
 );
 ```
 
-Delivery is **at-least-once** — make handlers idempotent, or let the worker do
-it for you (see below).
+Delivery is **at-least-once** — make handlers idempotent. The dispatcher's
+optional deduplication (see below) can skip some redeliveries, but it does not
+replace an idempotent handler.
 
 ## Idempotent consumption
 
 Because delivery is at-least-once, a transport may hand the same message to a
 worker more than once (after a crash before the ack, a lapsed reservation, or a
-broker hiccup). The dispatcher can dedupe these redeliveries so a message is
-processed **at most once** — opt in by giving it an `IdempotencyOptions`:
+broker hiccup). The dispatcher can skip such a redelivery instead of running the
+handler again — opt in by giving it an `IdempotencyOptions`:
 
 ```php
 use InitPHP\Queue\Consumer\Dispatcher;
@@ -182,12 +183,55 @@ $dispatcher = new Dispatcher(
 With no options (the default) deduplication is off and the dispatcher behaves
 exactly as before — this is fully backward-compatible.
 
+> **Deduplication is not exactly-once delivery and does not replace an idempotent
+> handler.** It can discard a message whose handler never completed, and it can
+> still run a handler twice. Read "What deduplication does not guarantee" below.
+
 **How it dedupes.** Before running a handler the dispatcher derives a stable
-dedup key from the message and *claims* it; a key that is already recorded means
-the message was processed before, so the handler is skipped and the message is
-acknowledged and discarded. The key is **only recorded after the handler
-succeeds** — a handler that throws leaves the key free, so the at-least-once
-redelivery is retried as normal.
+dedup key from the message and *claims* it in the store, holding the claim under a
+lease (`leaseSeconds`). If the claim succeeds the handler runs; when it returns,
+the key is **recorded** (`remember()`, kept for `ttl` seconds); when it throws,
+the claim is released, so the normal retry runs it again.
+
+If the claim fails, the dispatcher skips the handler and acknowledges the message,
+which discards it (the worker logs `job.dropped` with reason `duplicate`). A
+failed claim means one of two things, and the dispatcher cannot tell them apart:
+
+- the key was **recorded**: the message was handled before, so discarding it is
+  right; or
+- the key is **claimed but not recorded**: another worker is still inside the
+  handler, or died inside it and its lease has not expired yet. Discarding the
+  message here means the handler may never complete for it.
+
+The second case is the one to understand before you turn this on — see
+[What deduplication does not guarantee](#what-deduplication-does-not-guarantee).
+
+### What deduplication does not guarantee
+
+The dispatcher treats a claimed-but-unrecorded key (a handler still running, or
+one whose worker died) the same as a recorded one: it acknowledges and discards
+the message. So:
+
+1. **A message can be lost.** A worker claims the key and dies inside the handler;
+   the transport redelivers; the claim is still held, so the redelivery is
+   discarded and the handler never completes. With the defaults
+   (`leaseSeconds: 300`) on a `PdoTransport` (`retryAfter: 90`) this is exactly
+   what happens, and on RabbitMQ a closed connection redelivers immediately.
+2. **A handler can still run twice.** A worker that dies after the handler but
+   before `remember()` leaves no record; once the lease lapses the redelivery runs
+   the handler again. This is not "at most once".
+3. **A failed attempt can lose its retry.** If a handler outlives the transport's
+   redelivery time, the duplicate is discarded; on PDO that deletes the row, so
+   when the first handler throws there is no row left to retry.
+
+Set `leaseSeconds` **above your slowest handler** and **below the time the
+transport takes to redeliver a dead worker's message** (PDO: below `retryAfter`;
+Redis: below your reaper's delay; RabbitMQ: no safe value, since the broker redelivers at once and a redelivery picked up before the lease lapses is discarded). If no value fits,
+leave deduplication off and rely on an idempotent handler. The details and the
+per-transport table are in the
+[full guide](docs/Idempotent-Consumption.md#choosing-leaseseconds).
+
+### Message keys
 
 The key is derived, in order, from:
 
@@ -195,16 +239,23 @@ The key is derived, in order, from:
 2. the producer-minted **`meta.id`** (the canonical message identity), else
 3. the **`trace_id`**.
 
-A message with none of these has no stable identity and is processed without
-deduplication.
+A resolver result counts only when it is a **non-empty string**; anything else
+(`null`, `''`, an `int` order id) falls back to `meta.id`. A store is shared by
+every URN and keys are not scoped by it, so scope the key yourself:
 
 ```php
+use InitPHP\Queue\Message\ReceivedMessage;
+
 new IdempotencyOptions(
     store: $store,
     keyPrefix: 'bq:idemp:',   // namespaces keys in a shared store
     ttl: 86_400,              // seconds a processed key is retained (null = forever)
-    leaseSeconds: 300,        // in-flight claim lease (frees a crashed worker's claim)
-    keyResolver: fn ($m) => $m->getData()['order_id'] ?? null, // optional
+    leaseSeconds: 60,         // in-flight claim lease; see the notes above
+    keyResolver: static function (ReceivedMessage $message): ?string {
+        $orderId = $message->getData()['order_id'] ?? null;
+
+        return $orderId === null ? null : $message->getUrn() . ':' . $orderId;
+    },
 );
 ```
 
@@ -231,7 +282,8 @@ final class RedisIdempotencyStore implements IdempotencyStore
 
     public function claim(string $key, int $leaseSeconds = 0): bool
     {
-        // Atomic test-and-set: only the first caller wins the claim.
+        // Atomic test-and-set: only the first caller wins the claim. With EX the
+        // claim lapses on its own; without it (leaseSeconds 0) it never does.
         $options = ['NX'];
         if ($leaseSeconds > 0) {
             $options['EX'] = $leaseSeconds;
@@ -254,9 +306,18 @@ final class RedisIdempotencyStore implements IdempotencyStore
 }
 ```
 
-A PDO-backed store works the same way: `claim()` is an `INSERT` that fails on a
-unique `key` column (caught and reported as `false`), `remember()` upserts the
-row, and a `processed_at`/`expires_at` column drives the TTL.
+A PDO-backed store needs one more step than the Redis one, because a unique
+constraint does not expire rows by itself. Redis `EX` frees a lapsed claim on its
+own; with a table, `claim()` must free it explicitly or a dead worker's key stays
+blocked and every redelivery is discarded. In a transaction, first remove the row
+if its lease has lapsed (`DELETE FROM idempotency WHERE dedup_key = ? AND expires_at <= ?`),
+then `INSERT` it with `expires_at = now + leaseSeconds` and report `true` only
+when the insert affected a row (a unique-key violation means `false`). The same
+effect in one statement is `INSERT … ON CONFLICT (dedup_key) DO UPDATE SET expires_at =
+excluded.expires_at WHERE idempotency.expires_at <= ?` (SQLite and PostgreSQL),
+again checking the affected-row count. `remember()` upserts the row with
+`expires_at = now + ttl` (or `NULL` to keep it), `forget()` deletes it, and
+`seen()` ignores rows whose `expires_at` has passed.
 
 Full guide: [docs/Idempotent-Consumption.md](docs/Idempotent-Consumption.md).
 
