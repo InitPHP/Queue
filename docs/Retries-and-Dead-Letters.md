@@ -115,4 +115,6 @@ from `orders:failed`; for RabbitMQ, consume `orders.failed`.
 - Use `UnknownUrnStrategy::DEAD_LETTER` to quarantine unmapped messages for review
   rather than retrying them. See [Handlers & Routing](Handlers-and-Routing.md#unknown-urn-strategies).
 - Make handlers **idempotent** — at-least-once delivery means a handler can run
-  again for a message that actually succeeded but whose ack was lost.
+  again for a message that actually succeeded but whose ack was lost. The
+  dispatcher can also dedupe redeliveries — see
+  [Idempotent Consumption](Idempotent-Consumption.md).

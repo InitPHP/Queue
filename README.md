@@ -258,6 +258,8 @@ A PDO-backed store works the same way: `claim()` is an `INSERT` that fails on a
 unique `key` column (caught and reported as `false`), `remember()` upserts the
 row, and a `processed_at`/`expires_at` column drives the TTL.
 
+Full guide: [docs/Idempotent-Consumption.md](docs/Idempotent-Consumption.md).
+
 ## Unknown-URN strategy
 
 When a message arrives whose URN has no mapped handler, the dispatcher applies one

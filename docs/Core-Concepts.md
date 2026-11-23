@@ -92,7 +92,8 @@ queue **polyglot** — see [Interoperability](Interoperability.md).
 Delivery is **at-least-once**. A message reserved by a worker that then crashes
 becomes reservable again (the PDO visibility timeout; the Redis processing list).
 A handler may therefore run more than once for the same message, so **handlers
-must be idempotent**.
+must be idempotent** — or let the dispatcher dedupe redeliveries, see
+[Idempotent Consumption](Idempotent-Consumption.md).
 
 ## Error handling
 

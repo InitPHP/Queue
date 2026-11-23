@@ -46,7 +46,9 @@ installed. See [Retries & Dead-Letters](Retries-and-Dead-Letters.md).
 ### Is delivery exactly-once?
 
 No — it is **at-least-once**. A message can be delivered more than once (e.g. a
-worker crashes after handling but before acking). Make handlers **idempotent**.
+worker crashes after handling but before acking). Make handlers **idempotent**,
+or turn on the dispatcher's deduplication — see
+[Idempotent Consumption](Idempotent-Consumption.md).
 
 ### Can a Go / Python / Node service consume what PHP produces (and vice-versa)?
 

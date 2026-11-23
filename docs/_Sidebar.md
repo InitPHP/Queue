@@ -13,6 +13,7 @@
 - [Handlers & Routing](Handlers-and-Routing.md)
 - [The Worker](The-Worker.md)
 - [Retries & Dead-Letters](Retries-and-Dead-Letters.md)
+- [Idempotent Consumption](Idempotent-Consumption.md)
 
 **Transports**
 - [Overview](Transports.md)
