@@ -77,6 +77,15 @@ the cause is at-least-once redelivery (a reservation that lapsed after
 `retryAfter`), which is expected — make handlers idempotent. Raise `retryAfter`
 above your slowest handler's runtime if jobs are being reclaimed mid-flight.
 
+## A message was dropped as a duplicate but its handler never finished
+
+With deduplication on, a redelivery that finds its key still claimed is
+acknowledged and discarded (`job.dropped`, reason `duplicate`), even when the
+worker that took the claim died inside the handler. Lower `leaseSeconds` below
+the transport's redelivery time (PDO `retryAfter`) and above your slowest handler;
+on RabbitMQ no value is safe. See
+[Idempotent Consumption](Idempotent-Consumption.md#what-deduplication-does-not-guarantee).
+
 ## A message produced by another language is rejected
 
 - Check `meta.schema_version` — a version newer than this SDK understands is
