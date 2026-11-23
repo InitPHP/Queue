@@ -226,7 +226,7 @@ the message. So:
 
 Set `leaseSeconds` **above your slowest handler** and **below the time the
 transport takes to redeliver a dead worker's message** (PDO: below `retryAfter`;
-Redis: below your reaper's delay; RabbitMQ: no safe value). If no value fits,
+Redis: below your reaper's delay; RabbitMQ: no safe value, since the broker redelivers at once and a redelivery picked up before the lease lapses is discarded). If no value fits,
 leave deduplication off and rely on an idempotent handler. The details and the
 per-transport table are in the
 [full guide](docs/Idempotent-Consumption.md#choosing-leaseseconds).

@@ -78,7 +78,7 @@ redelivery finds the claim gone and runs the handler).
 | --- | --- | --- |
 | PDO | after `retryAfter` (default 90 s) | below `retryAfter`, above the slowest handler — for example `retryAfter: 120`, `leaseSeconds: 90` for handlers under a minute |
 | Redis | when your reaper moves it from `<queue>:processing` back onto the queue (there is no automatic reclaim) | below the reaper's delay |
-| RabbitMQ | as soon as the broker sees the connection or channel close, typically immediately | none — a crash inside a handler always discards the message while deduplication is on |
+| RabbitMQ | as soon as the broker sees the connection or channel close, typically immediately | no value is safe: a redelivery that is picked up before the lease lapses is discarded, and the broker redelivers at once |
 
 `leaseSeconds: 0` is not "no lease": the bundled `InMemoryIdempotencyStore` and the
 Redis store below then hold the claim with no expiry, so a dead worker's claim
