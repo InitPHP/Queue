@@ -25,6 +25,12 @@ final class InMemoryRedis implements ClientInterface
     /** @var array<string, array<string, float>> member => score */
     private array $zsets = [];
 
+    /**
+     * @param  bool  $scripting  False models a client without EVAL (the documented
+     *                           adapter surface, or a user without scripting rights).
+     */
+    public function __construct(private readonly bool $scripting = true) {}
+
     public function blmove(string $source, string $destination, string $from, string $to, int $timeout): ?string
     {
         if (empty($this->lists[$source])) {
@@ -119,17 +125,22 @@ final class InMemoryRedis implements ClientInterface
     }
 
     /**
-     * Emulates EVAL for the transport's scripts only.
+     * Emulates EVAL for the transport's scripts only. With `$scripting` false it
+     * behaves like an adapter that does not implement `eval` at all.
      *
      * @return int
      */
     public function eval(string $script, int $numKeys, string ...$args): mixed
     {
+        if (! $this->scripting) {
+            throw new BadMethodCallException('InMemoryRedis does not implement "eval".');
+        }
+
         $keys = array_slice($args, 0, $numKeys);
         $argv = array_slice($args, $numKeys);
 
         if (str_contains($script, '-- queue:release')) {
-            if ($this->lrem($keys[0], 1, $argv[0]) < 1) {
+            if (! $this->takeOwnership($keys[0], $keys[2], $keys[1], $argv[0])) {
                 return 0;
             }
             (float) $argv[2] > 0
@@ -140,7 +151,7 @@ final class InMemoryRedis implements ClientInterface
         }
 
         if (str_contains($script, '-- queue:dead-letter')) {
-            if ($this->lrem($keys[0], 1, $argv[0]) < 1) {
+            if (! $this->takeOwnership($keys[0], $keys[2], $keys[3], $argv[0])) {
                 return 0;
             }
             $this->rpush($keys[1], [$argv[1]]);
@@ -161,12 +172,28 @@ final class InMemoryRedis implements ClientInterface
         throw new BadMethodCallException('InMemoryRedis cannot evaluate this script.');
     }
 
+    /** The processing entry, else the live copy in the delayed set, else on the queue. */
+    private function takeOwnership(string $processing, string $delayed, string $queue, string $receipt): bool
+    {
+        return $this->lrem($processing, 1, $receipt) > 0
+            || $this->zrem($delayed, $receipt) > 0
+            || $this->lrem($queue, 1, $receipt) > 0;
+    }
+
     /**
      * @return list<string>
      */
     public function list(string $key): array
     {
         return $this->lists[$key] ?? [];
+    }
+
+    /**
+     * @return list<string> the members of a sorted set, by score
+     */
+    public function members(string $key): array
+    {
+        return $this->zrangebyscore($key, '-inf', '+inf');
     }
 
     public function zcard(string $key): int

@@ -109,15 +109,16 @@ were not run as separate scenarios.
    dead-letter queue. Without deduplication it simply crashed the worker again on
    every redelivery; with it, the message is picked up again each time the lease
    lapses. Watch for a message that keeps appearing.
-6. **On Redis, a reaper has to count its reclaims.** Redis never redelivers a
-   message by itself; a reaper moves it from `<queue>:processing` back onto the
-   queue. If the original handler is still running (slower than the reaper's
-   delay), its eventual failure is ignored, because the message is no longer
-   its own (see [Transport: Redis](Transport-Redis.md#delivery-semantics)). The
-   retry then has to come from the reclaimed copy, so have the reaper increment
-   `attempts` in the envelope it moves back, and keep its delay above your slowest
-   handler: otherwise a handler that always runs longer than the reaper and always
-   fails is never counted against `maxAttempts`.
+6. **On Redis, a reaper that rewrites the envelope hides the late failure.** Redis
+   never redelivers a message by itself; a reaper moves it from
+   `<queue>:processing` back onto the queue. If the original handler is still
+   running, its eventual failure replaces the reclaimed copy, so `attempts` keeps
+   climbing and `maxAttempts` still ends the message (see
+   [Transport: Redis](Transport-Redis.md#delivery-semantics)). That only works while
+   the copy still has the body the handler was given: a reaper that rewrites it
+   (to increment `attempts`, say) makes the late failure unmatchable, and only the
+   reaper's own count applies. A client without `EVAL` keeps the same rules but can
+   lose a message to a crash in the middle of a retry.
 
 ### Choosing `leaseSeconds`
 
@@ -131,7 +132,7 @@ being discarded.
 | Transport | When a dead worker's message comes back | Effect of the lease |
 | --- | --- | --- |
 | PDO | after `retryAfter` (default 90 s) | the redelivery is released and re-checked every `inFlightDelaySeconds` until the lease lapses, then handled |
-| Redis | when your reaper moves it from `<queue>:processing` back onto the queue (there is no automatic reclaim) | the same: it waits until the lease lapses; keep the reaper's delay above your slowest handler and have it count each reclaim as an attempt |
+| Redis | when your reaper moves it from `<queue>:processing` back onto the queue (there is no automatic reclaim) | the same: it waits until the lease lapses; keep the reaper's delay above your slowest handler |
 | RabbitMQ | as soon as the broker sees the connection or channel close, typically immediately | the same, re-checked about every `sleepWhenEmpty` seconds (at least 0.1 s), because RabbitMQ has no native delay |
 
 `leaseSeconds: 0` is not "no lease": the bundled `InMemoryIdempotencyStore` and the

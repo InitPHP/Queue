@@ -317,7 +317,7 @@ final class InFlightRedeliveryTest extends TestCase
         self::assertGreaterThan(time() + 30, strtotime((string) $pdo->query('SELECT available_at FROM jobs')->fetchColumn()));
     }
 
-    public function test_a_release_does_not_touch_a_row_another_worker_holds_now(): void
+    public function test_a_failure_still_counts_when_another_worker_holds_the_row(): void
     {
         $pdo = new PDO('sqlite::memory:');
         $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
@@ -333,11 +333,96 @@ final class InFlightRedeliveryTest extends TestCase
 
         $envelope = $message->envelope();
         $envelope['attempts'] = 1;
-        $transport->release($message, EnvelopeCodec::encode($envelope), 30);
+        $transport->release($message, EnvelopeCodec::encode($envelope), 60);
 
-        $row = $pdo->query('SELECT attempts, reserved_at FROM jobs')->fetch(PDO::FETCH_ASSOC);
-        self::assertSame(0, (int) $row['attempts'], 'the new holder keeps its row');
-        self::assertSame('2999-01-01 00:00:00', $row['reserved_at']);
+        $row = $pdo->query('SELECT attempts, reserved_at, available_at, payload FROM jobs')->fetch(PDO::FETCH_ASSOC);
+        self::assertSame(1, (int) $row['attempts'], 'the failed attempt is counted');
+        self::assertSame(1, EnvelopeCodec::decode($row['payload'])['attempts']);
+        self::assertSame('2999-01-01 00:00:00', $row['reserved_at'], 'the holder keeps its reservation');
+        self::assertGreaterThan(time() + 30, strtotime((string) $row['available_at']), 'the back-off is recorded');
+    }
+
+    public function test_a_holders_unchanged_release_does_not_shorten_a_recorded_back_off(): void
+    {
+        // A holds the row; B (its reservation lapsed) fails and records a 60 s back-off;
+        // A then puts the message back unchanged with a 5 s wait.
+        $pdo = new PDO('sqlite::memory:');
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $a = new PdoTransport($pdo, 'jobs', null, 'default', 0);
+        $a->createSchema();
+        $b = new PdoTransport($pdo, 'jobs', null, 'default', 0);
+        $a->publish($this->payload('msg-1'), 'orders');
+
+        $held = $a->reserve('orders');
+        $lapsed = $b->reserve('orders');
+        self::assertNotNull($held);
+        self::assertNotNull($lapsed);
+        $pdo->exec("UPDATE jobs SET reserved_at = '2999-01-01 00:00:00'"); // A's stamp differs from B's
+
+        $envelope = $lapsed->envelope();
+        $envelope['attempts'] = 1;
+        $b->release($lapsed, EnvelopeCodec::encode($envelope), 60);
+
+        $pdo->exec("UPDATE jobs SET reserved_at = '" . date('Y-m-d H:i:s') . "'"); // A's reservation again
+        $a->release($held, $held->rawBody(), 5);
+
+        $row = $pdo->query('SELECT attempts, available_at FROM jobs')->fetch(PDO::FETCH_ASSOC);
+        self::assertSame(1, (int) $row['attempts']);
+        self::assertGreaterThan(time() + 30, strtotime((string) $row['available_at']), 'the 60 s back-off was not cut to 5 s');
+    }
+
+    public function test_a_recorded_attempt_count_never_goes_back(): void
+    {
+        $pdo = new PDO('sqlite::memory:');
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $transport = new PdoTransport($pdo, 'jobs', null, 'default', 0);
+        $transport->createSchema();
+        $transport->publish($this->payload('msg-1'), 'orders');
+
+        $message = $transport->reserve('orders');
+        self::assertNotNull($message);
+        $pdo->exec('UPDATE jobs SET attempts = 3');
+
+        $envelope = $message->envelope();
+        $envelope['attempts'] = 1;
+        $transport->release($message, EnvelopeCodec::encode($envelope), 0);
+
+        self::assertSame(3, (int) $pdo->query('SELECT attempts FROM jobs')->fetchColumn());
+        self::assertNull($pdo->query('SELECT reserved_at FROM jobs')->fetchColumn() ?: null, 'the reservation is still released');
+    }
+
+    public function test_a_handler_slower_than_the_reservation_still_reaches_the_dead_letter_table_without_idempotency(): void
+    {
+        // No idempotency. Every time the handler throws, the row has meanwhile been
+        // taken over by another worker (a different reservation stamp).
+        $pdo = new PDO('sqlite::memory:');
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $transport = new PdoTransport($pdo, 'jobs', null, 'default', 90);
+        $transport->createSchema();
+        $transport->publish($this->payload('msg-1'), 'orders');
+
+        $handlers = (new HandlerMap())->register(self::URN, function () use ($pdo): void {
+            $pdo->exec("UPDATE jobs SET reserved_at = '2999-01-01 00:00:00'"); // taken over while we run
+
+            throw new RuntimeException('downstream failed');
+        });
+        $worker = new Worker($transport, new Dispatcher($handlers), new WorkerOptions(maxAttempts: 3, backoff: [0]));
+
+        $seen = [];
+        for ($i = 0; $i < 6; ++$i) {
+            $pdo->exec("UPDATE jobs SET reserved_at = NULL, available_at = '2000-01-01 00:00:00'"); // the other worker let go
+            if (! $worker->runOnce('orders')) {
+                break;
+            }
+            $attempts = $pdo->query('SELECT attempts FROM jobs')->fetchColumn();
+            if ($attempts !== false) {
+                $seen[] = (int) $attempts;
+            }
+        }
+
+        self::assertSame([1, 2], $seen, 'attempts climb on every failure');
+        self::assertSame(0, (int) $pdo->query('SELECT COUNT(*) FROM jobs')->fetchColumn());
+        self::assertSame(1, (int) $pdo->query('SELECT COUNT(*) FROM jobs_failed')->fetchColumn(), 'the message is dead-lettered at maxAttempts');
     }
 
     public function test_the_in_flight_delay_must_be_at_least_one_second(): void

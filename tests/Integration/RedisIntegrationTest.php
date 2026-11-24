@@ -123,7 +123,7 @@ final class RedisIntegrationTest extends TestCase
         self::assertSame(1, $this->copies());
     }
 
-    public function test_a_release_or_dead_letter_from_a_worker_that_lost_the_message_does_not_fork_it(): void
+    public function test_a_release_from_a_worker_that_lost_the_message_replaces_the_live_copy(): void
     {
         $message = $this->publishAndReserve();
         $this->reap($message);
@@ -131,10 +131,39 @@ final class RedisIntegrationTest extends TestCase
         $retry = $message->envelope();
         $retry['attempts'] = 1;
         $this->transport->release($message, EnvelopeCodec::encode($retry), 30);
+
+        self::assertSame(1, $this->copies(), 'still one copy');
+        self::assertSame(0, (int) $this->client->llen(self::QUEUE), 'the reaped copy was taken off the queue');
+        $parked = $this->client->zrange(self::QUEUE . ':delayed', 0, -1);
+        self::assertCount(1, $parked);
+        self::assertSame(1, EnvelopeCodec::decode($parked[0])['attempts'], 'the failed attempt is carried onto it');
+    }
+
+    public function test_a_dead_letter_from_a_worker_that_lost_the_message_quarantines_the_live_copy(): void
+    {
+        $message = $this->publishAndReserve();
+        $this->reap($message);
+
         $this->transport->deadLetter($message, $message->rawBody());
 
-        self::assertSame(1, $this->copies(), 'only the reaped copy is live');
-        self::assertSame(1, (int) $this->client->llen(self::QUEUE));
+        self::assertSame(1, $this->copies());
+        self::assertSame(0, (int) $this->client->llen(self::QUEUE));
+        self::assertSame(1, (int) $this->client->llen(self::QUEUE . ':failed'));
+    }
+
+    public function test_a_release_for_a_message_that_is_gone_is_ignored(): void
+    {
+        $message = $this->publishAndReserve();
+        $this->client->lrem(self::QUEUE . ':processing', 1, $message->rawBody());
+        $rewritten = $message->envelope();
+        $rewritten['attempts'] = 1;
+        $this->client->rpush(self::QUEUE, [EnvelopeCodec::encode($rewritten)]); // a reaper that counted the reclaim
+
+        $this->transport->release($message, $message->rawBody(), 0);
+        $this->transport->deadLetter($message, $message->rawBody());
+
+        self::assertSame(1, $this->copies());
+        self::assertSame(0, (int) $this->client->llen(self::QUEUE . ':failed'));
     }
 
     public function test_a_message_waiting_on_an_in_flight_key_is_parked_not_lost(): void

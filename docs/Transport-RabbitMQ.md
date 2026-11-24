@@ -67,10 +67,23 @@ The order is deliberate. A worker that dies between the publish and the ack leav
 a duplicate, which RabbitMQ redelivers and the dispatcher's
 [deduplication](Idempotent-Consumption.md) recognises; acking first would leave no
 message at all. If the publish throws, the original is not acked and RabbitMQ
-redelivers it. To also be safe against the broker not accepting the publish, put
-the channel in publisher-confirm mode (`$channel->confirm_select()`): the transport
-then waits (up to 30 s) for the confirm before it acks, and leaves the original
-unacked if none arrives. Without confirm mode that wait returns at once.
+redelivers it once the channel closes. To also be safe against the broker not
+accepting the publish, put the channel in publisher-confirm mode
+(`$channel->confirm_select()`). The transport then waits (up to 30 s) for the
+confirm before it acks:
+
+- a broker **`nack`** or a **returned** message means the new copy is not on the
+  queue (a full queue with `x-overflow: reject-publish`, for example). The original
+  is requeued with `basic_nack(requeue: true)`, not acked, and a `QueueException`
+  is thrown; the worker logs `process.failed` and the message is tried again. Your
+  own `set_nack_handler()` and `set_return_listener()` callbacks still run: the
+  transport wraps them for the wait and puts them back.
+- a **timeout** leaves the original unacked (it comes back when the channel
+  closes) and throws. The channel's pending confirms are then in an unknown state,
+  so restart the worker; until then every release waits for the lost confirm again.
+
+Without confirm mode that wait returns at once and a refused publish goes
+unnoticed, so enable confirms if the queue can refuse messages.
 
 The same path puts back a message that is **waiting for another handler's
 in-flight key** (a `release` with a delay). It lands at the tail of the queue, so

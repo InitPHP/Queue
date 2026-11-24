@@ -35,17 +35,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the message again in a tight loop.
 - `RedisTransport::release()`, `deadLetter()` and the delayed-set migration are
   single Lua scripts. They act only while the worker still owns the message (its
-  `LREM` removed one processing entry), so a release or dead-letter from a worker
-  whose message a reaper already moved back no longer forks it into two copies, and
-  a crash cannot leave a message on no list. Redis 6.2+ already required Lua.
+  `LREM` removed one processing entry), so a crash cannot leave a message on no
+  list. A release or dead-letter from a worker whose message a reaper already moved
+  back replaces the live copy (in the delayed set, or on the queue) instead of
+  adding a second one, so `attempts` still climbs and `maxAttempts` still ends the
+  message. A client that cannot `EVAL` (an adapter without `eval`, or a Redis user
+  without scripting permission) falls back to the same steps as separate commands
+  with the same rules, without atomicity; `reserve()`, `ack()` and `publish()` need
+  no scripting.
 - `AmqpTransport::release()` and `deadLetter()` publish the new copy (waiting for
   the broker's confirm when the channel is in confirm mode) **before** acking the
   original, so a crash between the two leaves a duplicate instead of losing the
-  message, and a failed publish leaves the original unacked.
-- `PdoTransport::release()` updates only a row still held with the reservation
-  stamp it wrote, and a message put back unchanged no longer rewrites `payload`
-  or `attempts`, so a worker whose reservation was taken over cannot overwrite
-  another worker's recorded retry or back-off.
+  message, and a failed publish leaves the original unacked. In confirm mode a
+  broker `nack` or a returned copy requeues the original (`basic_nack`, requeue)
+  and throws a `QueueException` instead of acking; the channel's own nack handler
+  and return listener keep running.
+- `PdoTransport::release()` no longer overwrites a reservation another worker took
+  over, and a message put back unchanged no longer rewrites `payload` or `attempts`
+  or shortens a recorded back-off. A failure reported by a worker whose reservation
+  was taken over still counts (the new `attempts`, payload and back-off are
+  recorded without touching the holder's reservation, and `attempts` never goes
+  back), so a handler slower than `retryAfter` that always fails still reaches
+  `maxAttempts` and the dead-letter table.
 - A message deferred to wait for an in-flight key no longer counts towards
   `maxJobs` or `processedCount()`, and the worker pauses at least 0.1 s after a
   deferral even with `sleepWhenEmpty: 0`.

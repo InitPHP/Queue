@@ -24,12 +24,14 @@ use PDO;
  * reservation older than `$retryAfter` seconds is treated as abandoned and
  * becomes reservable again, so a crashed worker never loses a message.
  *
- * `release()` is conditional on the reservation this transport instance took: a
+ * `release()` is conditional on the reservation this transport instance took. A
  * worker whose reservation lapsed and was taken over cannot overwrite the new
- * holder's row, and a verbatim release (a message put back unchanged) never
- * touches `payload` or `attempts`, so it cannot undo a retry another worker has
- * just recorded. The stamp has one-second resolution, so with `$retryAfter` of 0
- * two reservations inside the same second look alike.
+ * holder's reservation, but a retry it reports still counts: the new `attempts`
+ * and payload are recorded without touching the reservation, so `maxAttempts` is
+ * reached whoever holds the row. A verbatim release (a message put back
+ * unchanged) never touches `payload` or `attempts` and never shortens a back-off.
+ * The stamp has one-second resolution, so with `$retryAfter` of 0 two
+ * reservations inside the same second look alike.
  *
  * The whole envelope is stored as JSON in `payload`; `queue`, `urn`, `trace_id`
  * and `attempts` are denormalised into columns purely for indexing and
@@ -140,29 +142,87 @@ final class PdoTransport implements Transport, ConsumerTransport
         $stamp = $this->reservations[$id] ?? null;
         unset($this->reservations[$id]);
 
-        $params = [
-            ':available_at' => $this->at(max(0, $delaySeconds)),
-            ':id' => $id,
-        ];
+        $availableAt = $this->at(max(0, $delaySeconds));
 
         if ($payload === $message->rawBody()) {
-            // Put back unchanged: only reschedule, and only while the reservation
-            // is still ours; never rewrite a retry another worker recorded.
-            $set = 'available_at = :available_at, reserved_at = NULL';
-            $guard = $stamp !== null ? ' AND reserved_at = :stamp' : '';
-        } else {
-            $set = 'payload = :payload, attempts = :attempts, available_at = :available_at, reserved_at = NULL';
-            // A retry applies unless someone else holds the row right now.
-            $guard = $stamp !== null ? ' AND (reserved_at = :stamp OR reserved_at IS NULL)' : '';
-            $params[':payload'] = $payload;
-            $params[':attempts'] = $this->attemptsOf(EnvelopeCodec::decode($payload));
+            $this->putBackUnchanged($id, $stamp, $availableAt);
+
+            return;
         }
 
+        $attempts = $this->attemptsOf(EnvelopeCodec::decode($payload));
+
+        if ($stamp === null) {
+            // A message this instance did not reserve: no stamp to compare.
+            $this->pdo->prepare(
+                "UPDATE {$this->table} SET payload = :payload, attempts = :attempts, available_at = :available_at, reserved_at = NULL WHERE id = :id",
+            )->execute([':payload' => $payload, ':attempts' => $attempts, ':available_at' => $availableAt, ':id' => $id]);
+
+            return;
+        }
+
+        // A retry. Applies in full while the reservation is still ours, or the row
+        // has been released since. `attempts` only ever moves forward, so two
+        // workers recording the same failure cannot lower it. (payload comes first
+        // because MySQL evaluates the assignments left to right.)
+        $owned = $this->pdo->prepare(
+            "UPDATE {$this->table} SET"
+            . ' payload = CASE WHEN attempts > :attempts_a THEN payload ELSE :payload END,'
+            . ' attempts = CASE WHEN attempts > :attempts_b THEN attempts ELSE :attempts_c END,'
+            . ' available_at = :available_at, reserved_at = NULL'
+            . ' WHERE id = :id AND (reserved_at = :stamp OR reserved_at IS NULL)',
+        );
+        $owned->execute([
+            ':attempts_a' => $attempts,
+            ':attempts_b' => $attempts,
+            ':attempts_c' => $attempts,
+            ':payload' => $payload,
+            ':available_at' => $availableAt,
+            ':id' => $id,
+            ':stamp' => $stamp,
+        ]);
+
+        if ($owned->rowCount() > 0) {
+            return;
+        }
+
+        // Another worker holds the row now (our reservation lapsed and was taken
+        // over). The failure still counts: record the attempt and its back-off
+        // without touching the holder's reservation, so a handler that always runs
+        // longer than `retryAfter` still reaches `maxAttempts` and the dead-letter
+        // table, as it did before. A delay is only ever extended, never shortened.
+        $this->pdo->prepare(
+            "UPDATE {$this->table} SET payload = :payload, attempts = :attempts,"
+            . ' available_at = CASE WHEN available_at > :available_a THEN available_at ELSE :available_b END'
+            . ' WHERE id = :id AND attempts < :attempts_guard',
+        )->execute([
+            ':payload' => $payload,
+            ':attempts' => $attempts,
+            ':available_a' => $availableAt,
+            ':available_b' => $availableAt,
+            ':id' => $id,
+            ':attempts_guard' => $attempts,
+        ]);
+    }
+
+    /**
+     * Put a message back unchanged: only reschedule it, and only while the
+     * reservation is still ours, so it can neither undo a retry another worker has
+     * recorded nor shorten its back-off.
+     */
+    private function putBackUnchanged(int $id, ?string $stamp, string $availableAt): void
+    {
+        $guard = $stamp !== null ? ' AND reserved_at = :stamp' : '';
+        $params = [':available_a' => $availableAt, ':available_b' => $availableAt, ':id' => $id];
         if ($stamp !== null) {
             $params[':stamp'] = $stamp;
         }
 
-        $this->pdo->prepare("UPDATE {$this->table} SET {$set} WHERE id = :id{$guard}")->execute($params);
+        $this->pdo->prepare(
+            "UPDATE {$this->table} SET"
+            . ' available_at = CASE WHEN available_at > :available_a THEN available_at ELSE :available_b END,'
+            . " reserved_at = NULL WHERE id = :id{$guard}",
+        )->execute($params);
     }
 
     public function deadLetter(ReceivedMessage $message, string $payload): void

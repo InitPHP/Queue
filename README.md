@@ -228,10 +228,12 @@ is discarded.
 4. **A handler that kills its process never counts as failed**, so its `attempts`
    does not rise and it never reaches the dead-letter queue; it is picked up again
    each time the lease lapses.
-5. **On Redis a reaper has to count its reclaims.** A message the reaper has moved
-   back onto the queue is no longer the original worker's, so that worker's later
-   failure is ignored. Have the reaper increment `attempts` and keep its delay
-   above your slowest handler.
+5. **On Redis, a reaper that rewrites the envelope hides the late failure.** A
+   handler that outlives the reaper still has its failure counted (it replaces the
+   reclaimed copy, so `maxAttempts` ends the message), but only while the copy has
+   the body the handler was given. Keep the reaper's delay above your slowest
+   handler and move the body back unchanged. A Redis client without `EVAL` keeps the
+   same rules, but a crash in the middle of a retry can lose the message.
 
 Set `leaseSeconds` **above your slowest handler**, and as short as that allows: it
 is how long a dead worker's message waits before it is handled again. The
