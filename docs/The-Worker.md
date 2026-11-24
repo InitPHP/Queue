@@ -43,7 +43,7 @@ new WorkerOptions(
     maxAttempts: 3,        // total delivery attempts before dead-lettering (>= 1)
     backoff: [0],          // per-attempt delay in seconds; the last value repeats
     reserveTimeout: 5.0,   // seconds a blocking transport waits for a message
-    sleepWhenEmpty: 0.5,   // seconds to sleep when the queue is empty
+    sleepWhenEmpty: 0.5,   // seconds to sleep when the queue is empty (also after a deferral)
     maxJobs: 0,            // stop after N messages (0 = unlimited)
     maxRuntime: 0.0,       // stop after N seconds (0 = unlimited)
     memoryLimitMb: 0,      // stop once memory reaches N MB (0 = unlimited)
@@ -61,6 +61,12 @@ negative back-off, or a negative limit throws `ConfigurationException`.
 - **Polling transports** (PDO, RabbitMQ `basic_get`) return immediately when the
   queue is empty; the worker then sleeps for `sleepWhenEmpty`. Tune that for your
   latency/load trade-off.
+- **A deferred message** — put back with a delay because, with
+  [deduplication](Idempotent-Consumption.md) on, another handler still holds its
+  key — also makes the worker sleep for `sleepWhenEmpty`, but at least 0.1 s, so a
+  transport that ignores the delay (RabbitMQ) is not spun on even with
+  `sleepWhenEmpty: 0`. A deferral does not count towards `maxJobs` or
+  `processedCount()`.
 
 ### Stopping cleanly
 
@@ -72,7 +78,11 @@ new WorkerOptions(maxJobs: 1000, memoryLimitMb: 128);
 
 This is the standard pattern for long-running PHP — the process exits on its own
 terms and a fresh one starts with clean memory. `stopWhenEmpty: true` instead
-drains the queue and returns (useful for batch jobs and tests).
+drains the queue and returns (useful for batch jobs and tests). With deduplication
+on, a message waiting for another handler's key is not "empty" on RabbitMQ, which
+hands it straight back: a drain worker stays until that handler finishes or its
+lease lapses (for good if the claim never lapses). On PDO and Redis the waiting
+message is parked with its delay and the drain ends.
 
 ### Graceful shutdown
 
@@ -125,10 +135,10 @@ $worker = new Worker($transport, new Dispatcher($handlers), new WorkerOptions(),
 | `job.ack` | A handler succeeded. |
 | `job.retry` | A failure was re-queued (context has `attempt`, `delay`). |
 | `job.dead_letter` | A message was quarantined (context has `reason`, `attempts`, `error`). |
-| `job.dropped` | The message was acked-and-discarded: an unknown URN (`DELETE` strategy) or, with deduplication on, a duplicate (`reason` `duplicate`). |
-| `job.released` | An unknown URN was put back (`RELEASE` strategy). |
+| `job.dropped` | The message was acked-and-discarded: an unknown URN (`DELETE` strategy) or, with deduplication on, a duplicate whose handler already finished (`reason` `duplicate`). |
+| `job.released` | A message was put back without counting an attempt: an unknown URN (`RELEASE` strategy), or, with deduplication on, a key another handler still holds (`reason` `in_flight`, context has `delay`). |
 | `reserve.failed` | The transport threw while reserving (loop continues). |
-| `process.failed` | The transport threw while acting on a message (loop continues). |
+| `process.failed` | The transport threw while acting on a message (loop continues after a pause: the larger of 0.1 s, `sleepWhenEmpty` and the back-off for the message's next attempt, at most 5 s, ended at once by a stop signal). |
 
 ## The CLI
 

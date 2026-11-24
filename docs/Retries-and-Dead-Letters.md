@@ -116,6 +116,6 @@ from `orders:failed`; for RabbitMQ, consume `orders.failed`.
   rather than retrying them. See [Handlers & Routing](Handlers-and-Routing.md#unknown-urn-strategies).
 - Make handlers **idempotent** — at-least-once delivery means a handler can run
   again for a message that actually succeeded but whose ack was lost. The
-  dispatcher's optional deduplication is not a replacement: it can discard a
-  message whose handler never completed — see
+  dispatcher's optional deduplication is not a replacement: it can still run a
+  handler twice — see
   [Idempotent Consumption](Idempotent-Consumption.md#what-deduplication-does-not-guarantee).

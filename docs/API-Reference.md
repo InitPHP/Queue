@@ -92,6 +92,27 @@ public function dispatch(InitPHP\Queue\Message\ReceivedMessage $message): InitPH
 
 An unknown strategy string throws `ConfigurationException`.
 
+### IdempotencyOptions / InMemoryIdempotencyStore
+
+`InitPHP\Queue\Consumer\IdempotencyOptions` (immutable), passed to
+`Dispatcher`'s `idempotency:` argument:
+
+```php
+public function __construct(
+    InitPHP\Queue\Contracts\IdempotencyStore $store,
+    string $keyPrefix = 'bq:idemp:',
+    ?int $ttl = 86_400,                  // seconds a processed key is kept (null = forever)
+    int $leaseSeconds = 300,             // in-flight claim lease
+    ?callable $keyResolver = null,       // fn (ReceivedMessage): ?string
+    int $inFlightDelaySeconds = 5,       // wait before re-checking a key another handler holds (>= 1)
+)
+public function keyFor(InitPHP\Queue\Message\ReceivedMessage $message): ?string
+```
+
+A negative `ttl` or `leaseSeconds`, or an `inFlightDelaySeconds` below 1, throws
+`ConfigurationException`. `InitPHP\Queue\Consumer\InMemoryIdempotencyStore`
+implements `CompletionAwareIdempotencyStore` and adds `count(): int`.
+
 ### Outcome / OutcomeKind
 
 `InitPHP\Queue\Consumer\Outcome` — the dispatcher's decision (immutable).
@@ -100,12 +121,13 @@ An unknown strategy string throws `ConfigurationException`.
 public readonly OutcomeKind $kind;
 public readonly string $reason;          // '' | 'failed' | 'unknown_urn' | a validator reason
 public readonly ?\Throwable $exception;
+public readonly int $delaySeconds;       // 0 unless a release is delayed
 
 public static function ack(): self
 public static function retry(?\Throwable $exception = null, string $reason = 'failed'): self
 public static function deadLetter(string $reason, ?\Throwable $exception = null): self
 public static function drop(string $reason): self
-public static function release(string $reason): self
+public static function release(string $reason, int $delaySeconds = 0): self
 ```
 
 `InitPHP\Queue\Consumer\OutcomeKind` is an enum: `Ack`, `Retry`, `DeadLetter`,
@@ -164,6 +186,32 @@ interface HandlerResolver
     public function resolve(string $urn): ?Handler;
 }
 ```
+
+### IdempotencyStore
+
+```php
+interface IdempotencyStore
+{
+    public function seen(string $key): bool;
+    public function claim(string $key, int $leaseSeconds = 0): bool;
+    public function remember(string $key, ?int $ttl = null): void;
+    public function forget(string $key): void;
+}
+```
+
+### CompletionAwareIdempotencyStore
+
+```php
+interface CompletionAwareIdempotencyStore extends IdempotencyStore
+{
+    public function isCompleted(string $key): bool;   // recorded with remember(), still live
+}
+```
+
+Lets the `Dispatcher` tell a recorded key from one another handler still holds: a
+failed claim on a completed key is dropped, on an in-flight key the message is
+released. A store that implements only `IdempotencyStore` keeps the previous
+behaviour (always dropped). See [Idempotent Consumption](Idempotent-Consumption.md).
 
 ### ConsumerTransport
 

@@ -106,10 +106,32 @@ and becomes reservable again, so the message is delivered again (at-least-once)
 instead of staying stuck. Set it comfortably above your slowest handler's runtime.
 
 If you also enable the dispatcher's [deduplication](Idempotent-Consumption.md),
-keep its `leaseSeconds` **below** `retryAfter`: with the defaults (`retryAfter` 90,
-`leaseSeconds` 300) the redelivery of a dead worker's message arrives while its
-claim is still held, and it is discarded as a duplicate — see
+a redelivery that arrives while another handler's claim is still held (a dead
+worker's, or a handler that outlived `retryAfter`) is put back on the queue and
+re-checked, not discarded, so the row survives until that claim is recorded,
+released or lapses. Keep `leaseSeconds` above your slowest handler — see
 [Idempotent Consumption](Idempotent-Consumption.md#choosing-leaseseconds).
+
+### Releasing a row you no longer hold
+
+A worker whose reservation has lapsed and been taken over by another worker does
+not overwrite the new holder's reservation, but its failure still counts.
+`release()` for a retry has two outcomes:
+
+- while the row is still reserved with the stamp this transport instance wrote (or
+  has been released since), it records `attempts`, the payload and the back-off and
+  frees the row. `attempts` only ever moves forward;
+- if another worker holds the row now, it records the new `attempts` and payload and
+  extends the back-off, **without touching the holder's reservation**. So a handler
+  that always runs longer than `retryAfter` and always fails still reaches
+  `maxAttempts` and `jobs_failed`, as before. The holder's own outcome then
+  completes the job; this can take until its handler ends, so such a message is
+  dead-lettered later than a worker that cleared the other's reservation would have.
+
+A message put back **unchanged** (waiting for another handler) only reschedules the
+row, only while the reservation is still its own, and never shortens a back-off
+another worker recorded. The stamp has one-second resolution, so with
+`retryAfter: 0` two reservations within the same second look alike.
 
 ## Lifecycle in SQL terms
 

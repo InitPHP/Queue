@@ -28,6 +28,20 @@ use Throwable;
  */
 final class Worker
 {
+    /**
+     * The shortest pause after putting a message back with a delay, so a
+     * transport that ignores the delay (RabbitMQ) cannot be spun on even with
+     * `sleepWhenEmpty: 0`.
+     */
+    private const DEFERRAL_PAUSE_SECONDS = 0.1;
+
+    /**
+     * The longest pause after a message could not be acted on (the transport threw
+     * while acking, releasing or dead-lettering it). Kept short so a connection that
+     * needs heartbeats is not left idle for long.
+     */
+    private const FAILURE_PAUSE_CAP_SECONDS = 5.0;
+
     private bool $shouldStop = false;
 
     private int $processed = 0;
@@ -87,13 +101,18 @@ final class Worker
                 continue;
             }
 
+            $counted = true;
+
             try {
-                $this->process($message);
+                $counted = $this->process($message);
             } catch (Throwable $e) {
                 $this->log('error', 'process.failed', $this->context($message, ['error' => $e->getMessage()]));
+                $this->pauseAfterFailure($message);
             }
 
-            ++$this->processed;
+            if ($counted) {
+                ++$this->processed;
+            }
             $this->dispatchSignals();
         }
     }
@@ -110,8 +129,9 @@ final class Worker
             return false;
         }
 
-        $this->process($message);
-        ++$this->processed;
+        if ($this->process($message)) {
+            ++$this->processed;
+        }
 
         return true;
     }
@@ -125,14 +145,20 @@ final class Worker
     }
 
     /**
-     * Total messages processed across this worker's lifetime.
+     * Total messages processed across this worker's lifetime. A message put back
+     * to wait for another handler's in-flight key is not processing and is not
+     * counted, so waiting never uses up `maxJobs`.
      */
     public function processedCount(): int
     {
         return $this->processed;
     }
 
-    private function process(ReceivedMessage $message): void
+    /**
+     * Act on one message. Returns false when the message was only deferred (put
+     * back with a delay to wait for another handler), true when it was handled.
+     */
+    private function process(ReceivedMessage $message): bool
     {
         $outcome = $this->dispatcher->dispatch($message);
 
@@ -150,8 +176,20 @@ final class Worker
                 break;
 
             case OutcomeKind::Release:
-                $this->transport->release($message, $message->rawBody(), 0);
-                $this->log('notice', 'job.released', $this->context($message, ['reason' => $outcome->reason]));
+                $this->transport->release($message, $message->rawBody(), $outcome->delaySeconds);
+                $this->log('notice', 'job.released', $this->context($message, [
+                    'reason' => $outcome->reason,
+                    ...($outcome->delaySeconds > 0 ? ['delay' => $outcome->delaySeconds] : []),
+                ]));
+
+                // A delayed release is a message that is waiting on something else.
+                // Transports without native delay (RabbitMQ) hand it straight back,
+                // so pause briefly rather than reserving it again in a tight loop.
+                if ($outcome->delaySeconds > 0) {
+                    $this->sleep(max(self::DEFERRAL_PAUSE_SECONDS, $this->options->sleepWhenEmpty));
+
+                    return false;
+                }
 
                 break;
 
@@ -170,6 +208,8 @@ final class Worker
 
                 break;
         }
+
+        return true;
     }
 
     private function retry(ReceivedMessage $message, int $attempt): void
@@ -261,6 +301,59 @@ final class Worker
         if (function_exists('pcntl_signal_dispatch')) {
             pcntl_signal_dispatch();
         }
+    }
+
+    /**
+     * Wait before the next reservation after the transport failed to act on a
+     * message. Without it a message the broker keeps refusing (RabbitMQ rejecting a
+     * republish, a database that cannot be updated) comes straight back and its
+     * handler runs again at once. The wait is the larger of 0.1 s, `sleepWhenEmpty`
+     * and the back-off for the message's next attempt, capped at 5 s, and it is
+     * taken in short slices so a stop signal ends it at once.
+     */
+    private function pauseAfterFailure(ReceivedMessage $message): void
+    {
+        // A monotonic clock, so a wall-clock step cannot stretch the 5 s cap.
+        $until = hrtime(true) + (int) ($this->failurePauseSeconds($message) * 1_000_000_000);
+
+        while (! $this->shouldStop && ($left = ($until - hrtime(true)) / 1_000_000_000) > 0) {
+            $this->sleep(min($left, 0.25));
+            $this->dispatchSignals();
+        }
+    }
+
+    /**
+     * How long to wait after a failure on `$message`: the larger of 0.1 s,
+     * `sleepWhenEmpty` and the back-off for its next attempt, at most 5 s.
+     */
+    private function failurePauseSeconds(ReceivedMessage $message): float
+    {
+        // Capped so an `attempts` of PHP_INT_MAX (a foreign or damaged message) cannot
+        // overflow into a float here, outside the failure handling that called us.
+        $nextAttempt = min($message->attempts(), PHP_INT_MAX - 1) + 1;
+
+        return min(
+            self::FAILURE_PAUSE_CAP_SECONDS,
+            max(self::DEFERRAL_PAUSE_SECONDS, $this->options->sleepWhenEmpty, $this->backoffFor($nextAttempt)),
+        );
+    }
+
+    /**
+     * The configured back-off for `$attempt`, read defensively: `backoff` is
+     * documented as a list of ints, but a map (`[1 => 5]`) or floats (`[0.5]`) can
+     * reach it, and the pause runs outside the failure handling, so it must not
+     * throw. Anything that is not a number counts as no back-off.
+     */
+    private function backoffFor(int $attempt): float
+    {
+        $delays = array_values($this->options->backoff);
+        if ($delays === []) {
+            return 0.0;
+        }
+
+        $delay = $delays[min(max($attempt, 1) - 1, count($delays) - 1)];
+
+        return is_int($delay) || is_float($delay) ? (float) $delay : 0.0;
     }
 
     private function sleep(float $seconds): void

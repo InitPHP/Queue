@@ -22,6 +22,7 @@ final class Outcome
         public readonly OutcomeKind $kind,
         public readonly string $reason = '',
         public readonly ?Throwable $exception = null,
+        public readonly int $delaySeconds = 0,
     ) {}
 
     /** Handled successfully. */
@@ -48,9 +49,13 @@ final class Outcome
         return new self(OutcomeKind::Drop, $reason);
     }
 
-    /** Put back verbatim, no attempt counted. */
-    public static function release(string $reason): self
+    /**
+     * Put back verbatim, no attempt counted. A positive `$delaySeconds` keeps the
+     * message from becoming reservable again until it has elapsed (best-effort on
+     * transports without native delay support).
+     */
+    public static function release(string $reason, int $delaySeconds = 0): self
     {
-        return new self(OutcomeKind::Release, $reason);
+        return new self(OutcomeKind::Release, $reason, null, max(0, $delaySeconds));
     }
 }

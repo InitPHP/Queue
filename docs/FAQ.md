@@ -48,7 +48,7 @@ installed. See [Retries & Dead-Letters](Retries-and-Dead-Letters.md).
 No — it is **at-least-once**. A message can be delivered more than once (e.g. a
 worker crashes after handling but before acking). Make handlers **idempotent**.
 The dispatcher's optional deduplication can skip some redeliveries, but it is not
-a substitute: it can also discard a message whose handler never completed — see
+a substitute: it can still run a handler twice — see
 [Idempotent Consumption](Idempotent-Consumption.md#what-deduplication-does-not-guarantee).
 
 ### Can a Go / Python / Node service consume what PHP produces (and vice-versa)?

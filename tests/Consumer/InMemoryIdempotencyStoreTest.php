@@ -65,4 +65,33 @@ final class InMemoryIdempotencyStoreTest extends TestCase
         self::assertTrue($store->claim('k', 0));
         self::assertTrue($store->seen('k'));
     }
+
+    public function test_is_completed_tells_a_recorded_key_from_an_in_flight_claim(): void
+    {
+        $store = new InMemoryIdempotencyStore();
+
+        self::assertFalse($store->isCompleted('k'), 'unknown');
+
+        $store->claim('k', 300);
+        self::assertTrue($store->seen('k'));
+        self::assertFalse($store->isCompleted('k'), 'a claim is in flight, not completed');
+
+        $store->remember('k');
+        self::assertTrue($store->isCompleted('k'));
+
+        $store->forget('k');
+        self::assertFalse($store->isCompleted('k'));
+    }
+
+    public function test_an_expired_record_is_no_longer_completed(): void
+    {
+        $store = new InMemoryIdempotencyStore();
+        $store->remember('k', 1);
+
+        self::assertTrue($store->isCompleted('k'));
+
+        usleep(1_100_000);
+
+        self::assertFalse($store->isCompleted('k'));
+    }
 }

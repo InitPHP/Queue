@@ -52,16 +52,54 @@ auto_delete=false`); the body is the canonical envelope JSON.
 | `publish()` | Declare the queue, `basic_publish` the persistent envelope. |
 | `reserve()` | Declare the queue, then `basic_get` one message (pull). Returns `null` when empty. |
 | `ack()` | `basic_ack` on the delivery tag. |
-| `release()` | `basic_ack` the original, then **republish** the updated envelope. |
-| `deadLetter()` | `basic_ack` the original, then publish the annotated envelope to `<queue>.failed`. |
+| `release()` | **Republish** the updated envelope, wait for the broker's confirm if the channel is in confirm mode, then `basic_ack` the original. |
+| `deadLetter()` | Publish the annotated envelope to `<queue>.failed`, wait for the confirm likewise, then `basic_ack` the original. |
 
 ### Why retries republish
 
 RabbitMQ does not let you mutate a message body in place, and a plain
 `basic_nack(requeue=true)` would not persist the incremented `attempts` or the
-`dead_letter` block. So a retry/dead-letter **acks the original delivery and
-publishes a fresh message** carrying the updated envelope. This keeps `attempts`
-and dead-letter annotations accurate across redeliveries.
+`dead_letter` block. So a retry/dead-letter **publishes a fresh message**
+carrying the updated envelope **and only then acks the original delivery**. This
+keeps `attempts` and dead-letter annotations accurate across redeliveries.
+
+The order is deliberate. A worker that dies between the publish and the ack leaves
+a duplicate, which RabbitMQ redelivers and the dispatcher's
+[deduplication](Idempotent-Consumption.md) recognises; acking first would leave no
+message at all. If the publish throws, the original is not acked and RabbitMQ
+redelivers it once the channel closes. To also be safe against the broker not
+accepting the publish, put the channel in publisher-confirm mode
+(`$channel->confirm_select()`). The transport then waits (up to 30 s) for the
+confirm before it acks:
+
+- a broker **`nack`** or a **returned** message means the new copy is not on the
+  queue (a full queue with `x-overflow: reject-publish`, for example). The original
+  is requeued with `basic_nack(requeue: true)`, not acked, and a `QueueException`
+  is thrown; the worker logs `process.failed`, **pauses** (see below) and the
+  message is tried again. Your own `set_nack_handler()` and `set_return_listener()`
+  callbacks still run: the transport wraps them for the wait and puts them back.
+  The requeued message is the original, so its `attempts` do not advance and no
+  back-off is recorded on it: RabbitMQ cannot take the new copy, so there is
+  nothing to carry the new count. The handler runs again on every retry of that
+  message, paced only by the worker's failure pause (the larger of 0.1 s,
+  `sleepWhenEmpty` and the back-off for its next attempt, at most 5 s), until the
+  broker accepts the copy: a queue that stays full keeps the message cycling, so
+  fix or drain it, and give the handler idempotent effects.
+- confirms are tracked per channel: a nack for **another publish on the same channel**
+  (say your own handler's) also counts against the message being settled, and
+  requeues it although its copy was confirmed, which only costs a duplicate. Publish
+  from a handler on a separate channel.
+- a **timeout** leaves the original unacked (it comes back when the channel
+  closes) and throws. The channel's pending confirms are then in an unknown state,
+  so restart the worker; until then every release waits for the lost confirm again.
+
+Without confirm mode that wait returns at once and a refused publish goes
+unnoticed, so enable confirms if the queue can refuse messages.
+
+The same path puts back a message that is **waiting for another handler's
+in-flight key** (a `release` with a delay). It lands at the tail of the queue, so
+other messages are not blocked behind it, and the worker pauses briefly after each
+such release because RabbitMQ ignores the delay.
 
 ### Delay caveat
 

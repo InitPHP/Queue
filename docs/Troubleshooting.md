@@ -77,13 +77,17 @@ the cause is at-least-once redelivery (a reservation that lapsed after
 `retryAfter`), which is expected — make handlers idempotent. Raise `retryAfter`
 above your slowest handler's runtime if jobs are being reclaimed mid-flight.
 
-## A message was dropped as a duplicate but its handler never finished
+## A message keeps being released with reason `in_flight`
 
-With deduplication on, a redelivery that finds its key still claimed is
-acknowledged and discarded (`job.dropped`, reason `duplicate`), even when the
-worker that took the claim died inside the handler. Lower `leaseSeconds` below
-the transport's redelivery time (PDO `retryAfter`) and above your slowest handler;
-on RabbitMQ no value is safe. See
+With deduplication on, a redelivery that finds its key claimed by a handler that
+has not finished is put back on the queue (`job.released`, reason `in_flight`)
+and re-checked after `inFlightDelaySeconds`; it costs no retry attempt. It stops
+when the other handler records the key (the message is dropped as a duplicate),
+releases its claim after a failure, or when the claim's lease lapses. If it goes on
+for much longer than `leaseSeconds`, the claim never lapses: the store holds it
+without an expiry (`leaseSeconds: 0`) or does not honour the lease, so call
+`forget()` on the key. A store that implements only `IdempotencyStore` never
+releases a message this way; it discards it. See
 [Idempotent Consumption](Idempotent-Consumption.md#what-deduplication-does-not-guarantee).
 
 ## A message produced by another language is rejected
