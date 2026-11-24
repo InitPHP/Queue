@@ -75,9 +75,20 @@ confirm before it acks:
 - a broker **`nack`** or a **returned** message means the new copy is not on the
   queue (a full queue with `x-overflow: reject-publish`, for example). The original
   is requeued with `basic_nack(requeue: true)`, not acked, and a `QueueException`
-  is thrown; the worker logs `process.failed` and the message is tried again. Your
-  own `set_nack_handler()` and `set_return_listener()` callbacks still run: the
-  transport wraps them for the wait and puts them back.
+  is thrown; the worker logs `process.failed`, **pauses** (see below) and the
+  message is tried again. Your own `set_nack_handler()` and `set_return_listener()`
+  callbacks still run: the transport wraps them for the wait and puts them back.
+  The requeued message is the original, so its `attempts` do not advance and no
+  back-off is recorded on it: RabbitMQ cannot take the new copy, so there is
+  nothing to carry the new count. The handler runs again on every retry of that
+  message, paced only by the worker's failure pause (the larger of 0.1 s,
+  `sleepWhenEmpty` and the back-off for its next attempt, at most 5 s), until the
+  broker accepts the copy: a queue that stays full keeps the message cycling, so
+  fix or drain it, and give the handler idempotent effects.
+- confirms are tracked per channel: a nack for **another publish on the same channel**
+  (say your own handler's) also counts against the message being settled, and
+  requeues it although its copy was confirmed, which only costs a duplicate. Publish
+  from a handler on a separate channel.
 - a **timeout** leaves the original unacked (it comes back when the channel
   closes) and throws. The channel's pending confirms are then in an unknown state,
   so restart the worker; until then every release waits for the lost confirm again.

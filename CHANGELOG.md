@@ -57,6 +57,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   recorded without touching the holder's reservation, and `attempts` never goes
   back), so a handler slower than `retryAfter` that always fails still reaches
   `maxAttempts` and the dead-letter table.
+- The `Worker` pauses after the transport fails to act on a message
+  (`process.failed`): the larger of 0.1 s, `sleepWhenEmpty` and the back-off for the
+  message's next attempt, at most 5 s, in short slices that a stop signal ends at
+  once. A message RabbitMQ keeps refusing (a nacked republish) no longer re-runs its
+  handler in a tight loop. Its `attempts` still do not advance while the broker
+  refuses the copy; see the RabbitMQ page.
 - A message deferred to wait for an in-flight key no longer counts towards
   `maxJobs` or `processedCount()`, and the worker pauses at least 0.1 s after a
   deferral even with `sleepWhenEmpty: 0`.

@@ -35,6 +35,13 @@ final class Worker
      */
     private const DEFERRAL_PAUSE_SECONDS = 0.1;
 
+    /**
+     * The longest pause after a message could not be acted on (the transport threw
+     * while acking, releasing or dead-lettering it). Kept short so a connection that
+     * needs heartbeats is not left idle for long.
+     */
+    private const FAILURE_PAUSE_CAP_SECONDS = 5.0;
+
     private bool $shouldStop = false;
 
     private int $processed = 0;
@@ -100,6 +107,7 @@ final class Worker
                 $counted = $this->process($message);
             } catch (Throwable $e) {
                 $this->log('error', 'process.failed', $this->context($message, ['error' => $e->getMessage()]));
+                $this->pauseAfterFailure($message);
             }
 
             if ($counted) {
@@ -292,6 +300,32 @@ final class Worker
     {
         if (function_exists('pcntl_signal_dispatch')) {
             pcntl_signal_dispatch();
+        }
+    }
+
+    /**
+     * Wait before the next reservation after the transport failed to act on a
+     * message. Without it a message the broker keeps refusing (RabbitMQ rejecting a
+     * republish, a database that cannot be updated) comes straight back and its
+     * handler runs again at once. The wait is the larger of 0.1 s, `sleepWhenEmpty`
+     * and the back-off for the message's next attempt, capped at 5 s, and it is
+     * taken in short slices so a stop signal ends it at once.
+     */
+    private function pauseAfterFailure(ReceivedMessage $message): void
+    {
+        $seconds = min(
+            self::FAILURE_PAUSE_CAP_SECONDS,
+            max(
+                self::DEFERRAL_PAUSE_SECONDS,
+                $this->options->sleepWhenEmpty,
+                (float) $this->options->delayForAttempt($message->attempts() + 1),
+            ),
+        );
+        $until = microtime(true) + $seconds;
+
+        while (! $this->shouldStop && ($left = $until - microtime(true)) > 0) {
+            $this->sleep(min($left, 0.25));
+            $this->dispatchSignals();
         }
     }
 

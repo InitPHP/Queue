@@ -228,9 +228,7 @@ final class RedisTransport implements Transport, ConsumerTransport
         if ($e instanceof ServerException) {
             $reason = strtolower($e->getMessage());
 
-            return str_contains($reason, 'noperm')
-                || str_contains($reason, 'unknown command')
-                || str_contains($reason, 'not allowed');
+            return str_contains($reason, 'noperm') || str_contains($reason, 'unknown command');
         }
 
         return false;

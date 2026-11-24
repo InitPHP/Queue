@@ -138,7 +138,7 @@ $worker = new Worker($transport, new Dispatcher($handlers), new WorkerOptions(),
 | `job.dropped` | The message was acked-and-discarded: an unknown URN (`DELETE` strategy) or, with deduplication on, a duplicate whose handler already finished (`reason` `duplicate`). |
 | `job.released` | A message was put back without counting an attempt: an unknown URN (`RELEASE` strategy), or, with deduplication on, a key another handler still holds (`reason` `in_flight`, context has `delay`). |
 | `reserve.failed` | The transport threw while reserving (loop continues). |
-| `process.failed` | The transport threw while acting on a message (loop continues). |
+| `process.failed` | The transport threw while acting on a message (loop continues after a pause: the larger of 0.1 s, `sleepWhenEmpty` and the back-off for the message's next attempt, at most 5 s, ended at once by a stop signal). |
 
 ## The CLI
 
