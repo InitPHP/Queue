@@ -4,28 +4,30 @@ declare(strict_types=1);
 
 namespace InitPHP\Queue\Consumer;
 
-use InitPHP\Queue\Contracts\IdempotencyStore;
+use InitPHP\Queue\Contracts\CompletionAwareIdempotencyStore;
 
 /**
- * The bundled reference {@see IdempotencyStore}: an in-process array of seen
+ * The bundled reference {@see \InitPHP\Queue\Contracts\IdempotencyStore}: an in-process array of seen
  * keys with monotonic-clock expiry.
  *
  * It is correct for a **single-process** worker — it makes a redelivered
  * message processed at most once for as long as the process lives — and is the
  * store the test-suite drives. It is **not** shared across processes and does
  * not survive a restart, so it cannot dedupe across the whole fleet: for that,
- * back {@see IdempotencyStore} with Redis, a database table or `initphp/cache`.
+ * back {@see \InitPHP\Queue\Contracts\IdempotencyStore} with Redis, a database table or `initphp/cache`.
  * See the README "Idempotent consumption" section for the BYO pattern.
  *
  * Expiry uses {@see hrtime()} (a monotonic clock) so it is immune to wall-clock
  * jumps; a null expiry means "remembered forever".
  */
-final class InMemoryIdempotencyStore implements IdempotencyStore
+final class InMemoryIdempotencyStore implements CompletionAwareIdempotencyStore
 {
     /**
-     * key => expiry in nanoseconds on the monotonic clock, or null for never.
+     * key => entry. `expiry` is nanoseconds on the monotonic clock, or null for
+     * never; `completed` is true once the key was recorded with remember() and
+     * false while it is only an in-flight claim.
      *
-     * @var array<string, int|null>
+     * @var array<string, array{expiry: int|null, completed: bool}>
      */
     private array $entries = [];
 
@@ -37,7 +39,7 @@ final class InMemoryIdempotencyStore implements IdempotencyStore
             return false;
         }
 
-        $expiry = $this->entries[$key];
+        $expiry = $this->entries[$key]['expiry'];
         if ($expiry !== null && hrtime(true) >= $expiry) {
             unset($this->entries[$key]);
 
@@ -55,14 +57,22 @@ final class InMemoryIdempotencyStore implements IdempotencyStore
 
         // Hold the claim under a short lease so a crash mid-handler frees it for
         // the redelivery, rather than blocking the key forever.
-        $this->entries[$key] = $this->expiryFor($leaseSeconds > 0 ? $leaseSeconds : null);
+        $this->entries[$key] = [
+            'expiry' => $this->expiryFor($leaseSeconds > 0 ? $leaseSeconds : null),
+            'completed' => false,
+        ];
 
         return true;
     }
 
+    public function isCompleted(string $key): bool
+    {
+        return $this->seen($key) && $this->entries[$key]['completed'];
+    }
+
     public function remember(string $key, ?int $ttl = null): void
     {
-        $this->entries[$key] = $this->expiryFor($ttl);
+        $this->entries[$key] = ['expiry' => $this->expiryFor($ttl), 'completed' => true];
     }
 
     public function forget(string $key): void

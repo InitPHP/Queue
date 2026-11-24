@@ -150,8 +150,18 @@ final class Worker
                 break;
 
             case OutcomeKind::Release:
-                $this->transport->release($message, $message->rawBody(), 0);
-                $this->log('notice', 'job.released', $this->context($message, ['reason' => $outcome->reason]));
+                $this->transport->release($message, $message->rawBody(), $outcome->delaySeconds);
+                $this->log('notice', 'job.released', $this->context($message, [
+                    'reason' => $outcome->reason,
+                    ...($outcome->delaySeconds > 0 ? ['delay' => $outcome->delaySeconds] : []),
+                ]));
+
+                // A delayed release is a message that is waiting on something else.
+                // Transports without native delay (RabbitMQ) hand it straight back,
+                // so pause briefly rather than reserving it again in a tight loop.
+                if ($outcome->delaySeconds > 0) {
+                    $this->sleep($this->options->sleepWhenEmpty);
+                }
 
                 break;
 

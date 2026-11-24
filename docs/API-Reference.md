@@ -100,12 +100,13 @@ An unknown strategy string throws `ConfigurationException`.
 public readonly OutcomeKind $kind;
 public readonly string $reason;          // '' | 'failed' | 'unknown_urn' | a validator reason
 public readonly ?\Throwable $exception;
+public readonly int $delaySeconds;       // 0 unless a release is delayed
 
 public static function ack(): self
 public static function retry(?\Throwable $exception = null, string $reason = 'failed'): self
 public static function deadLetter(string $reason, ?\Throwable $exception = null): self
 public static function drop(string $reason): self
-public static function release(string $reason): self
+public static function release(string $reason, int $delaySeconds = 0): self
 ```
 
 `InitPHP\Queue\Consumer\OutcomeKind` is an enum: `Ack`, `Retry`, `DeadLetter`,

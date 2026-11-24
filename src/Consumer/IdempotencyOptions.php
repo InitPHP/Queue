@@ -45,6 +45,12 @@ final class IdempotencyOptions
      *                            may be reclaimed should the worker die mid-handler.
      * @param  (callable(ReceivedMessage): ?string)|null  $keyResolver  Optional
      *         custom key derivation; return null/'' to fall back to meta.id/trace_id.
+     * @param  int  $inFlightDelaySeconds  When a redelivery finds its key claimed
+     *         by a handler that has not finished (and the store is a
+     *         {@see \InitPHP\Queue\Contracts\CompletionAwareIdempotencyStore}), the
+     *         message is put back and not offered again for this many seconds.
+     *         The redelivery consumes no attempt, so this only paces the checks;
+     *         it must be at least 1 so a waiting message cannot spin.
      *
      * @throws ConfigurationException When a numeric option is out of range.
      */
@@ -54,6 +60,7 @@ final class IdempotencyOptions
         public readonly ?int $ttl = 86_400,
         public readonly int $leaseSeconds = 300,
         ?callable $keyResolver = null,
+        public readonly int $inFlightDelaySeconds = 5,
     ) {
         if ($ttl !== null && $ttl < 0) {
             throw new ConfigurationException('Idempotency ttl must be null or zero/positive.');
@@ -61,6 +68,10 @@ final class IdempotencyOptions
 
         if ($leaseSeconds < 0) {
             throw new ConfigurationException('Idempotency leaseSeconds must be zero or positive.');
+        }
+
+        if ($inFlightDelaySeconds < 1) {
+            throw new ConfigurationException('Idempotency inFlightDelaySeconds must be at least 1.');
         }
 
         $this->keyResolver = $keyResolver !== null ? $keyResolver(...) : null;

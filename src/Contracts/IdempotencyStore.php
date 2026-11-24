@@ -15,18 +15,28 @@ namespace InitPHP\Queue\Contracts;
  * worker restarts or shared between workers must be backed by a persistent
  * store — Redis (`SET key 1 NX EX <ttl>`), a database row, or the
  * `initphp/cache` PSR-16 pool. Bring your own by implementing this interface
- * over that backend; the {@see \InitPHP\Queue\Consumer\Dispatcher} only ever
- * calls {@see claim()} and {@see remember()}.
+ * over that backend. The {@see \InitPHP\Queue\Consumer\Dispatcher} calls
+ * {@see claim()} before a handler, then {@see remember()} when it succeeds or
+ * {@see forget()} when it throws.
+ *
+ * To let the dispatcher tell a *finished* message from one another worker is
+ * still handling (and so not discard the latter), implement
+ * {@see CompletionAwareIdempotencyStore} as well. A store that only implements
+ * this interface keeps the original behaviour: any failed claim is treated as
+ * an already-processed duplicate.
  *
  * Contract — the dedup lifecycle the dispatcher relies on:
  *
  *  1. Before running a handler the dispatcher calls {@see claim()}. If it
  *     returns `false` the key is already known (processed, or in flight on
- *     another worker) and the handler is skipped.
- *  2. The handler runs. If it **throws**, the key must remain *unremembered*
- *     so the redelivery is retryable — implementations that mark a key inside
- *     {@see claim()} must therefore give it only a short in-flight lease, not a
- *     permanent record.
+ *     another worker) and the handler is skipped. A processed key is
+ *     acknowledged and discarded; an in-flight key is discarded too unless the
+ *     store is a {@see CompletionAwareIdempotencyStore}, in which case the
+ *     message is put back on the queue to be retried later.
+ *  2. The handler runs. If it **throws**, the dispatcher calls {@see forget()}
+ *     to release the claim so the redelivery is retryable — implementations
+ *     that mark a key inside {@see claim()} must also give it only a short
+ *     in-flight lease, not a permanent record, in case the worker dies instead.
  *  3. On success the dispatcher calls {@see remember()} to record the key
  *     permanently (for `$ttl` seconds, or forever when `$ttl` is null).
  *
@@ -75,8 +85,8 @@ interface IdempotencyStore
 
     /**
      * Drop any record (processed or in-flight) for `$key`, making it
-     * processable again. Primarily for tests and operational reset; the
-     * dispatcher never calls it.
+     * processable again. The dispatcher calls it to release the in-flight claim
+     * when a handler throws; it is also the operational reset for a key.
      */
     public function forget(string $key): void;
 }

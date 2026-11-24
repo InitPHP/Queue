@@ -106,9 +106,10 @@ and becomes reservable again, so the message is delivered again (at-least-once)
 instead of staying stuck. Set it comfortably above your slowest handler's runtime.
 
 If you also enable the dispatcher's [deduplication](Idempotent-Consumption.md),
-keep its `leaseSeconds` **below** `retryAfter`: with the defaults (`retryAfter` 90,
-`leaseSeconds` 300) the redelivery of a dead worker's message arrives while its
-claim is still held, and it is discarded as a duplicate — see
+a redelivery that arrives while another handler's claim is still held (a dead
+worker's, or a handler that outlived `retryAfter`) is put back on the queue and
+re-checked, not discarded, so the row survives until that claim is recorded,
+released or lapses. Keep `leaseSeconds` above your slowest handler — see
 [Idempotent Consumption](Idempotent-Consumption.md#choosing-leaseseconds).
 
 ## Lifecycle in SQL terms

@@ -184,8 +184,8 @@ With no options (the default) deduplication is off and the dispatcher behaves
 exactly as before — this is fully backward-compatible.
 
 > **Deduplication is not exactly-once delivery and does not replace an idempotent
-> handler.** It can discard a message whose handler never completed, and it can
-> still run a handler twice. Read "What deduplication does not guarantee" below.
+> handler.** It can still run a handler twice. Read "What deduplication does not
+> guarantee" below.
 
 **How it dedupes.** Before running a handler the dispatcher derives a stable
 dedup key from the message and *claims* it in the store, holding the claim under a
@@ -193,42 +193,35 @@ lease (`leaseSeconds`). If the claim succeeds the handler runs; when it returns,
 the key is **recorded** (`remember()`, kept for `ttl` seconds); when it throws,
 the claim is released, so the normal retry runs it again.
 
-If the claim fails, the dispatcher skips the handler and acknowledges the message,
-which discards it (the worker logs `job.dropped` with reason `duplicate`). A
-failed claim means one of two things, and the dispatcher cannot tell them apart:
+If the claim fails, the key is either **recorded** (the message was handled before:
+it is acknowledged and discarded, `job.dropped` with reason `duplicate`) or
+**claimed but not recorded** (another worker is still inside the handler, or died
+inside it and its lease has not lapsed). In the second case the message is **not**
+discarded: it is put back on the queue (`job.released`, reason `in_flight`)
+without counting an attempt, and looked at again after `inFlightDelaySeconds`
+(default 5). It ends when the other handler records the key (the message is then
+dropped), when that handler fails and releases the claim, or when a dead worker's
+lease lapses (the handler then runs). Waiting never moves a message towards the
+dead-letter queue, and it is paced rather than a tight loop.
 
-- the key was **recorded**: the message was handled before, so discarding it is
-  right; or
-- the key is **claimed but not recorded**: another worker is still inside the
-  handler, or died inside it and its lease has not expired yet. Discarding the
-  message here means the handler may never complete for it.
-
-The second case is the one to understand before you turn this on — see
-[What deduplication does not guarantee](#what-deduplication-does-not-guarantee).
+This needs a store that implements `CompletionAwareIdempotencyStore`
+(`InMemoryIdempotencyStore` does). A store that implements only `IdempotencyStore`
+cannot tell the two cases apart and keeps the previous behaviour: any failed claim
+is discarded.
 
 ### What deduplication does not guarantee
 
-The dispatcher treats a claimed-but-unrecorded key (a handler still running, or
-one whose worker died) the same as a recorded one: it acknowledges and discards
-the message. So:
-
-1. **A message can be lost.** A worker claims the key and dies inside the handler;
-   the transport redelivers; the claim is still held, so the redelivery is
-   discarded and the handler never completes. With the defaults
-   (`leaseSeconds: 300`) on a `PdoTransport` (`retryAfter: 90`) this is exactly
-   what happens, and on RabbitMQ a closed connection redelivers immediately.
-2. **A handler can still run twice.** A worker that dies after the handler but
+1. **A handler can still run twice.** A worker that dies after the handler but
    before `remember()` leaves no record; once the lease lapses the redelivery runs
    the handler again. This is not "at most once".
-3. **A failed attempt can lose its retry.** If a handler outlives the transport's
-   redelivery time, the duplicate is discarded; on PDO that deletes the row, so
-   when the first handler throws there is no row left to retry.
+2. **A handler that outlives its lease can run twice**, because a second worker
+   then wins the claim.
+3. **A claim that never lapses keeps its message waiting.** Give every claim a
+   lease; `leaseSeconds: 0` holds it until `forget()`.
 
-Set `leaseSeconds` **above your slowest handler** and **below the time the
-transport takes to redeliver a dead worker's message** (PDO: below `retryAfter`;
-Redis: below your reaper's delay; RabbitMQ: no safe value, since the broker redelivers at once and a redelivery picked up before the lease lapses is discarded). If no value fits,
-leave deduplication off and rely on an idempotent handler. The details and the
-per-transport table are in the
+Set `leaseSeconds` **above your slowest handler**, and as short as that allows: it
+is how long a dead worker's message waits before it is handled again. The
+per-transport table and the upgrade notes for 2.1/2.2 are in the
 [full guide](docs/Idempotent-Consumption.md#choosing-leaseseconds).
 
 ### Message keys
@@ -251,6 +244,7 @@ new IdempotencyOptions(
     keyPrefix: 'bq:idemp:',   // namespaces keys in a shared store
     ttl: 86_400,              // seconds a processed key is retained (null = forever)
     leaseSeconds: 60,         // in-flight claim lease; see the notes above
+    inFlightDelaySeconds: 5,  // wait before re-checking a key another handler holds
     keyResolver: static function (ReceivedMessage $message): ?string {
         $orderId = $message->getData()['order_id'] ?? null;
 
@@ -269,9 +263,9 @@ exactly how the InitPHP ecosystem treats Cache and Database backends as
 pluggable seams:
 
 ```php
-use InitPHP\Queue\Contracts\IdempotencyStore;
+use InitPHP\Queue\Contracts\CompletionAwareIdempotencyStore;
 
-final class RedisIdempotencyStore implements IdempotencyStore
+final class RedisIdempotencyStore implements CompletionAwareIdempotencyStore
 {
     public function __construct(private \Redis $redis) {}
 
@@ -289,14 +283,23 @@ final class RedisIdempotencyStore implements IdempotencyStore
             $options['EX'] = $leaseSeconds;
         }
 
-        return (bool) $this->redis->set($key, '1', $options);
+        return (bool) $this->redis->set($key, 'claimed', $options);
+    }
+
+    public function isCompleted(string $key): bool
+    {
+        // 'claimed' is an in-flight claim. Anything else that exists is a record,
+        // including the '1' that 2.1/2.2 stored for both claims and records.
+        $value = $this->redis->get($key);
+
+        return $value !== false && $value !== 'claimed';
     }
 
     public function remember(string $key, ?int $ttl = null): void
     {
         $ttl !== null && $ttl > 0
-            ? $this->redis->set($key, '1', ['EX' => $ttl])
-            : $this->redis->set($key, '1');
+            ? $this->redis->set($key, 'done', ['EX' => $ttl])
+            : $this->redis->set($key, 'done');
     }
 
     public function forget(string $key): void
@@ -305,6 +308,10 @@ final class RedisIdempotencyStore implements IdempotencyStore
     }
 }
 ```
+
+`CompletionAwareIdempotencyStore` extends `IdempotencyStore`; the one method it adds,
+`isCompleted()`, is what lets the dispatcher keep an in-flight message instead of
+discarding it. Without it a store still works, with the 2.2 behaviour.
 
 A PDO-backed store needs one more step than the Redis one, because a unique
 constraint does not expire rows by itself. Redis `EX` frees a lapsed claim on its
@@ -316,8 +323,12 @@ when the insert affected a row (a unique-key violation means `false`). The same
 effect in one statement is `INSERT … ON CONFLICT (dedup_key) DO UPDATE SET expires_at =
 excluded.expires_at WHERE idempotency.expires_at <= ?` (SQLite and PostgreSQL),
 again checking the affected-row count. `remember()` upserts the row with
-`expires_at = now + ttl` (or `NULL` to keep it), `forget()` deletes it, and
-`seen()` ignores rows whose `expires_at` has passed.
+`expires_at = now + ttl` (or `NULL` to keep it) and marks it completed, `forget()`
+deletes it, and `seen()` ignores rows whose `expires_at` has passed. For
+`isCompleted()` add a `completed` flag column: `claim()` inserts it as `0`,
+`remember()` sets it to `1`, and `isCompleted()` returns true for a live row whose
+flag is `1`. Give the column a default of `1`, so rows written before you added it
+read as completed.
 
 Full guide: [docs/Idempotent-Consumption.md](docs/Idempotent-Consumption.md).
 

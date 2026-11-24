@@ -7,6 +7,7 @@ namespace InitPHP\Queue\Consumer;
 use BabelQueue\Exceptions\UnknownUrnException;
 use BabelQueue\Routing\UnknownUrnStrategy;
 use BabelQueue\Validation\EnvelopeValidator;
+use InitPHP\Queue\Contracts\CompletionAwareIdempotencyStore;
 use InitPHP\Queue\Contracts\Handler;
 use InitPHP\Queue\Contracts\HandlerResolver;
 use InitPHP\Queue\Exceptions\ConfigurationException;
@@ -26,8 +27,11 @@ use Throwable;
  * When an {@see IdempotencyOptions} is supplied the pipeline gains a
  * deduplication step: a redelivered message whose key is already recorded is
  * dropped without re-running the handler, and a key is only recorded *after*
- * the handler succeeds — so a throwing handler stays retryable. With no options
- * (the default) the dispatcher behaves exactly as before.
+ * the handler succeeds — so a throwing handler stays retryable. A redelivery
+ * whose key is only claimed by a handler that has not finished is not dropped
+ * (when the store is a {@see CompletionAwareIdempotencyStore}): it is put back
+ * on the queue, so the message survives that handler failing or its worker
+ * dying. With no options (the default) the dispatcher behaves exactly as before.
  */
 final class Dispatcher
 {
@@ -77,18 +81,17 @@ final class Dispatcher
      * Run the resolved handler, guarded by the idempotency layer when enabled.
      *
      * The dedup key is claimed *before* the handler runs (so a concurrent
-     * redelivery is skipped) and only committed with {@see IdempotencyStore::remember()}
+     * redelivery is not run twice) and only committed with {@see IdempotencyStore::remember()}
      * *after* the handler returns — a throwing handler leaves the key
      * uncommitted, so the at-least-once redelivery is retried as normal.
      */
     private function runHandler(Handler $handler, ReceivedMessage $message): Outcome
     {
-        $key = $this->idempotency?->keyFor($message);
+        $idempotency = $this->idempotency;
+        $key = $idempotency?->keyFor($message);
 
-        // A duplicate that is already recorded: it was processed before, so
-        // acknowledge and discard rather than running the handler again.
-        if ($key !== null && ! $this->idempotency->store->claim($key, $this->idempotency->leaseSeconds)) {
-            return Outcome::drop('duplicate');
+        if ($idempotency !== null && $key !== null && ! $idempotency->store->claim($key, $idempotency->leaseSeconds)) {
+            return $this->onClaimLost($idempotency, $key);
         }
 
         try {
@@ -96,18 +99,44 @@ final class Dispatcher
         } catch (Throwable $e) {
             // Release the in-flight claim so the redelivery can re-run; leaving
             // it set would suppress a legitimate retry.
-            if ($key !== null) {
-                $this->idempotency->store->forget($key);
+            if ($idempotency !== null && $key !== null) {
+                $idempotency->store->forget($key);
             }
 
             return Outcome::retry($e, 'failed');
         }
 
-        if ($key !== null) {
-            $this->idempotency->store->remember($key, $this->idempotency->ttl);
+        if ($idempotency !== null && $key !== null) {
+            $idempotency->store->remember($key, $idempotency->ttl);
         }
 
         return Outcome::ack();
+    }
+
+    /**
+     * The claim failed: the key is recorded as processed, or another worker holds
+     * it while its handler runs.
+     *
+     * A processed message is acknowledged and discarded. A message whose handler
+     * has not finished is *not*: that handler may still throw or its worker may
+     * have died, and discarding the only copy would lose the message. It is
+     * released verbatim instead (no attempt counted, so waiting never walks it
+     * towards the dead-letter queue) and not offered again for
+     * {@see IdempotencyOptions::$inFlightDelaySeconds}; once the other handler
+     * records the key the redelivery is dropped, and once its claim is released or
+     * its lease lapses the redelivery runs the handler.
+     *
+     * A store that cannot tell the two apart keeps the original behaviour.
+     */
+    private function onClaimLost(IdempotencyOptions $idempotency, string $key): Outcome
+    {
+        $store = $idempotency->store;
+
+        if ($store instanceof CompletionAwareIdempotencyStore && ! $store->isCompleted($key)) {
+            return Outcome::release('in_flight', $idempotency->inFlightDelaySeconds);
+        }
+
+        return Outcome::drop('duplicate');
     }
 
     private function onUnknownUrn(ReceivedMessage $message): Outcome

@@ -93,8 +93,8 @@ Delivery is **at-least-once**. A message reserved by a worker that then crashes
 becomes reservable again (the PDO visibility timeout; the Redis processing list).
 A handler may therefore run more than once for the same message, so **handlers
 must be idempotent**. The dispatcher's optional deduplication can skip some
-redeliveries but does not replace that, and it has a message-loss window of its
-own — see [Idempotent Consumption](Idempotent-Consumption.md#what-deduplication-does-not-guarantee).
+redeliveries but does not replace that, and it can still run a handler twice —
+see [Idempotent Consumption](Idempotent-Consumption.md#what-deduplication-does-not-guarantee).
 
 ## Error handling
 
