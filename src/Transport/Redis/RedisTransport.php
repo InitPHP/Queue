@@ -23,10 +23,62 @@ use Predis\ClientInterface;
  * Delayed retries use a `<queue>:delayed` sorted set drained on each reserve, and
  * dead-letters go to a `<queue>:failed` list.
  *
- * Requires Redis 6.2+ (for `BLMOVE`). Optional dependency: `predis/predis`.
+ * `release()`, `deadLetter()` and the delayed-set migration each run as one Lua
+ * script, so they are atomic: a worker that dies half way cannot leave a message
+ * on no list at all. `release()` and `deadLetter()` also act only while the
+ * message is still **this worker's** (its `LREM` from the processing list removes
+ * one entry); if a reaper has already moved the message back onto the queue, the
+ * live copy belongs to whoever reserves it next and the stale write is ignored,
+ * which keeps one message from forking into two copies.
+ *
+ * Requires Redis 6.2+ (for `BLMOVE`; Lua scripting is built in). Optional
+ * dependency: `predis/predis`.
  */
 final class RedisTransport implements Transport, ConsumerTransport
 {
+    /**
+     * KEYS: processing, queue, delayed. ARGV: receipt, payload, due time (0 = now).
+     * Re-queues only when this worker still owns the processing entry.
+     */
+    private const RELEASE_SCRIPT = <<<'LUA'
+        -- queue:release
+        if redis.call('LREM', KEYS[1], 1, ARGV[1]) < 1 then
+            return 0
+        end
+        if tonumber(ARGV[3]) > 0 then
+            redis.call('ZADD', KEYS[3], ARGV[3], ARGV[2])
+        else
+            redis.call('RPUSH', KEYS[2], ARGV[2])
+        end
+        return 1
+        LUA;
+
+    /**
+     * KEYS: processing, failed. ARGV: receipt, payload.
+     */
+    private const DEAD_LETTER_SCRIPT = <<<'LUA'
+        -- queue:dead-letter
+        if redis.call('LREM', KEYS[1], 1, ARGV[1]) < 1 then
+            return 0
+        end
+        redis.call('RPUSH', KEYS[2], ARGV[2])
+        return 1
+        LUA;
+
+    /**
+     * KEYS: delayed, queue. ARGV: now. Moves due members, each removed and
+     * pushed in the same step, so none can be lost or duplicated.
+     */
+    private const MIGRATE_SCRIPT = <<<'LUA'
+        -- queue:migrate
+        local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 1000)
+        for _, member in ipairs(due) do
+            redis.call('ZREM', KEYS[1], member)
+            redis.call('RPUSH', KEYS[2], member)
+        end
+        return #due
+        LUA;
+
     private readonly BabelRedisTransport $publisher;
 
     public function __construct(
@@ -74,39 +126,46 @@ final class RedisTransport implements Transport, ConsumerTransport
 
     public function release(ReceivedMessage $message, string $payload, int $delaySeconds = 0): void
     {
-        $this->client->lrem($message->queue() . $this->processingSuffix, 1, (string) $message->receipt());
+        $queue = $message->queue();
 
-        if ($delaySeconds > 0) {
-            $this->client->zadd($message->queue() . $this->delayedSuffix, [$payload => time() + $delaySeconds]);
-
-            return;
-        }
-
-        $this->client->rpush($message->queue(), [$payload]);
+        $this->client->eval(
+            self::RELEASE_SCRIPT,
+            3,
+            $queue . $this->processingSuffix,
+            $queue,
+            $queue . $this->delayedSuffix,
+            (string) $message->receipt(),
+            $payload,
+            (string) ($delaySeconds > 0 ? time() + $delaySeconds : 0),
+        );
     }
 
     public function deadLetter(ReceivedMessage $message, string $payload): void
     {
-        $this->client->lrem($message->queue() . $this->processingSuffix, 1, (string) $message->receipt());
-        $this->client->rpush($message->queue() . $this->failedSuffix, [$payload]);
+        $queue = $message->queue();
+
+        $this->client->eval(
+            self::DEAD_LETTER_SCRIPT,
+            2,
+            $queue . $this->processingSuffix,
+            $queue . $this->failedSuffix,
+            (string) $message->receipt(),
+            $payload,
+        );
     }
 
     /**
-     * Move any delayed messages whose time has come back onto the main queue. A
-     * member is re-enqueued only by the worker that wins its `ZREM`, so a delayed
-     * retry is not duplicated across concurrent workers.
+     * Move any delayed messages whose time has come back onto the main queue, in
+     * one atomic script so concurrent workers cannot duplicate or drop them.
      */
     private function migrateDueDelayed(string $queue): void
     {
-        $key = $queue . $this->delayedSuffix;
-
-        /** @var list<string> $due */
-        $due = $this->client->zrangebyscore($key, '-inf', (string) time());
-
-        foreach ($due as $payload) {
-            if ((int) $this->client->zrem($key, $payload) > 0) {
-                $this->client->rpush($queue, [$payload]);
-            }
-        }
+        $this->client->eval(
+            self::MIGRATE_SCRIPT,
+            2,
+            $queue . $this->delayedSuffix,
+            $queue,
+            (string) time(),
+        );
     }
 }

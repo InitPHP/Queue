@@ -24,6 +24,13 @@ use PDO;
  * reservation older than `$retryAfter` seconds is treated as abandoned and
  * becomes reservable again, so a crashed worker never loses a message.
  *
+ * `release()` is conditional on the reservation this transport instance took: a
+ * worker whose reservation lapsed and was taken over cannot overwrite the new
+ * holder's row, and a verbatim release (a message put back unchanged) never
+ * touches `payload` or `attempts`, so it cannot undo a retry another worker has
+ * just recorded. The stamp has one-second resolution, so with `$retryAfter` of 0
+ * two reservations inside the same second look alike.
+ *
  * The whole envelope is stored as JSON in `payload`; `queue`, `urn`, `trace_id`
  * and `attempts` are denormalised into columns purely for indexing and
  * inspection.
@@ -33,6 +40,9 @@ use PDO;
 final class PdoTransport implements Transport, ConsumerTransport
 {
     private readonly string $failedTable;
+
+    /** @var array<int, string> row id => the `reserved_at` stamp this instance wrote at reserve() */
+    private array $reservations = [];
 
     /**
      * @param  PDO  $pdo  A connection in exception error mode (PHP 8's default).
@@ -105,6 +115,7 @@ final class PdoTransport implements Transport, ConsumerTransport
 
             $claim->execute([':reserved' => $now, ':id' => $row['id'], ':stale' => $stale]);
             if ($claim->rowCount() === 1) {
+                $this->reservations[(int) $row['id']] = $now;
                 $payload = (string) $row['payload'];
 
                 return new ReceivedMessage($queue, $payload, EnvelopeCodec::decode($payload), (int) $row['id']);
@@ -116,6 +127,8 @@ final class PdoTransport implements Transport, ConsumerTransport
 
     public function ack(ReceivedMessage $message): void
     {
+        unset($this->reservations[(int) $message->receipt()]);
+
         $this->pdo
             ->prepare("DELETE FROM {$this->table} WHERE id = :id")
             ->execute([':id' => (int) $message->receipt()]);
@@ -123,20 +136,39 @@ final class PdoTransport implements Transport, ConsumerTransport
 
     public function release(ReceivedMessage $message, string $payload, int $delaySeconds = 0): void
     {
-        $envelope = EnvelopeCodec::decode($payload);
+        $id = (int) $message->receipt();
+        $stamp = $this->reservations[$id] ?? null;
+        unset($this->reservations[$id]);
 
-        $this->pdo->prepare(
-            "UPDATE {$this->table} SET payload = :payload, attempts = :attempts, available_at = :available_at, reserved_at = NULL WHERE id = :id",
-        )->execute([
-            ':payload' => $payload,
-            ':attempts' => $this->attemptsOf($envelope),
+        $params = [
             ':available_at' => $this->at(max(0, $delaySeconds)),
-            ':id' => (int) $message->receipt(),
-        ]);
+            ':id' => $id,
+        ];
+
+        if ($payload === $message->rawBody()) {
+            // Put back unchanged: only reschedule, and only while the reservation
+            // is still ours; never rewrite a retry another worker recorded.
+            $set = 'available_at = :available_at, reserved_at = NULL';
+            $guard = $stamp !== null ? ' AND reserved_at = :stamp' : '';
+        } else {
+            $set = 'payload = :payload, attempts = :attempts, available_at = :available_at, reserved_at = NULL';
+            // A retry applies unless someone else holds the row right now.
+            $guard = $stamp !== null ? ' AND (reserved_at = :stamp OR reserved_at IS NULL)' : '';
+            $params[':payload'] = $payload;
+            $params[':attempts'] = $this->attemptsOf(EnvelopeCodec::decode($payload));
+        }
+
+        if ($stamp !== null) {
+            $params[':stamp'] = $stamp;
+        }
+
+        $this->pdo->prepare("UPDATE {$this->table} SET {$set} WHERE id = :id{$guard}")->execute($params);
     }
 
     public function deadLetter(ReceivedMessage $message, string $payload): void
     {
+        unset($this->reservations[(int) $message->receipt()]);
+
         $envelope = EnvelopeCodec::decode($payload);
         $deadLetter = is_array($envelope['dead_letter'] ?? null) ? $envelope['dead_letter'] : [];
         $now = $this->now();

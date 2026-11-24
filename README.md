@@ -202,7 +202,14 @@ without counting an attempt, and looked at again after `inFlightDelaySeconds`
 (default 5). It ends when the other handler records the key (the message is then
 dropped), when that handler fails and releases the claim, or when a dead worker's
 lease lapses (the handler then runs). Waiting never moves a message towards the
-dead-letter queue, and it is paced rather than a tight loop.
+dead-letter queue, and it is paced rather than a tight loop: the message is held
+back for `inFlightDelaySeconds` and the worker pauses for `sleepWhenEmpty` (at
+least 0.1 s) after each deferral. A deferral is not counted as processing, so it
+does not use up `maxJobs`; on RabbitMQ a `stopWhenEmpty` (drain) worker stays
+until the other handler finishes or its lease lapses. Each transport puts the
+message back without a step that could lose it: PDO in one `UPDATE`, RabbitMQ by
+publishing the copy before acking the original (a crash in between leaves a
+duplicate, never a gap), Redis in one Lua script.
 
 This needs a store that implements `CompletionAwareIdempotencyStore`
 (`InMemoryIdempotencyStore` does). A store that implements only `IdempotencyStore`
@@ -218,10 +225,18 @@ is discarded.
    then wins the claim.
 3. **A claim that never lapses keeps its message waiting.** Give every claim a
    lease; `leaseSeconds: 0` holds it until `forget()`.
+4. **A handler that kills its process never counts as failed**, so its `attempts`
+   does not rise and it never reaches the dead-letter queue; it is picked up again
+   each time the lease lapses.
+5. **On Redis a reaper has to count its reclaims.** A message the reaper has moved
+   back onto the queue is no longer the original worker's, so that worker's later
+   failure is ignored. Have the reaper increment `attempts` and keep its delay
+   above your slowest handler.
 
 Set `leaseSeconds` **above your slowest handler**, and as short as that allows: it
 is how long a dead worker's message waits before it is handled again. The
-per-transport table and the upgrade notes for 2.1/2.2 are in the
+per-transport table and the upgrade notes for 2.1/2.2 (drain the old workers
+first) are in the
 [full guide](docs/Idempotent-Consumption.md#choosing-leaseseconds).
 
 ### Message keys
@@ -321,14 +336,16 @@ if its lease has lapsed (`DELETE FROM idempotency WHERE dedup_key = ? AND expire
 then `INSERT` it with `expires_at = now + leaseSeconds` and report `true` only
 when the insert affected a row (a unique-key violation means `false`). The same
 effect in one statement is `INSERT … ON CONFLICT (dedup_key) DO UPDATE SET expires_at =
-excluded.expires_at WHERE idempotency.expires_at <= ?` (SQLite and PostgreSQL),
+excluded.expires_at, completed = 0 WHERE idempotency.expires_at <= ?` (SQLite and PostgreSQL),
 again checking the affected-row count. `remember()` upserts the row with
 `expires_at = now + ttl` (or `NULL` to keep it) and marks it completed, `forget()`
 deletes it, and `seen()` ignores rows whose `expires_at` has passed. For
-`isCompleted()` add a `completed` flag column: `claim()` inserts it as `0`,
-`remember()` sets it to `1`, and `isCompleted()` returns true for a live row whose
-flag is `1`. Give the column a default of `1`, so rows written before you added it
-read as completed.
+`isCompleted()` add a `completed` flag column: `claim()` sets it to `0`, **also when
+it takes over a lapsed row** (the one-statement form needs `completed = 0` in its
+`DO UPDATE SET` list: a takeover that keeps the old `1` makes the next redelivery
+look completed and drops the message), `remember()` sets it to
+`1`, and `isCompleted()` returns true for a live row whose flag is `1`. Give the
+column a default of `1`, so rows written before you added it read as completed.
 
 Full guide: [docs/Idempotent-Consumption.md](docs/Idempotent-Consumption.md).
 

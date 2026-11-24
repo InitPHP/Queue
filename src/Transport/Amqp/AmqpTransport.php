@@ -22,8 +22,13 @@ use PhpAmqpLib\Channel\AMQPChannel;
  * time with `basic_get`; `ack` is `basic_ack` on the delivery tag.
  *
  * Because RabbitMQ does not version a message body in place, a retry/dead-letter
- * acks the original delivery and republishes the updated envelope (so `attempts`
- * and the `dead_letter` block persist). Per-message delay is not applied — it
+ * republishes the updated envelope (so `attempts` and the `dead_letter` block
+ * persist) and only then acks the original delivery. That order is deliberate: a
+ * worker that dies between the two leaves a duplicate (which the dispatcher's
+ * idempotency layer recognises), where acking first would leave nothing; and if
+ * the publish fails the original is not acked and RabbitMQ redelivers it. When the
+ * caller has put the channel in publisher-confirm mode (`confirm_select()`), the
+ * ack also waits for the broker to confirm the new copy. Per-message delay is not applied — it
  * needs the delayed-message exchange plugin; configure that on the broker if you
  * need back-off windows.
  *
@@ -31,6 +36,9 @@ use PhpAmqpLib\Channel\AMQPChannel;
  */
 final class AmqpTransport implements Transport, ConsumerTransport
 {
+    /** Seconds to wait for publisher confirms before giving up on the ack. */
+    private const CONFIRM_TIMEOUT = 30;
+
     private readonly BabelAmqpTransport $publisher;
 
     public function __construct(
@@ -69,14 +77,27 @@ final class AmqpTransport implements Transport, ConsumerTransport
 
     public function release(ReceivedMessage $message, string $payload, int $delaySeconds = 0): void
     {
-        $this->channel->basic_ack($this->deliveryTag($message));
-        $this->publisher->publish($payload, $message->queue());
+        $this->republishThenAck($message, $payload, $message->queue());
     }
 
     public function deadLetter(ReceivedMessage $message, string $payload): void
     {
+        $this->republishThenAck($message, $payload, $message->queue() . $this->failedSuffix);
+    }
+
+    /**
+     * Publish the new copy, make sure the broker has it, then ack the original. A
+     * failure before the ack leaves the original unacked, so it is redelivered.
+     */
+    private function republishThenAck(ReceivedMessage $message, string $payload, string $target): void
+    {
+        $this->publisher->publish($payload, $target);
+
+        // Returns at once unless the channel is in publisher-confirm mode, in which
+        // case it blocks until the broker has confirmed (or throws on timeout).
+        $this->channel->wait_for_pending_acks(self::CONFIRM_TIMEOUT);
+
         $this->channel->basic_ack($this->deliveryTag($message));
-        $this->publisher->publish($payload, $message->queue() . $this->failedSuffix);
     }
 
     private function deliveryTag(ReceivedMessage $message): int

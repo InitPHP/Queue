@@ -52,16 +52,30 @@ auto_delete=false`); the body is the canonical envelope JSON.
 | `publish()` | Declare the queue, `basic_publish` the persistent envelope. |
 | `reserve()` | Declare the queue, then `basic_get` one message (pull). Returns `null` when empty. |
 | `ack()` | `basic_ack` on the delivery tag. |
-| `release()` | `basic_ack` the original, then **republish** the updated envelope. |
-| `deadLetter()` | `basic_ack` the original, then publish the annotated envelope to `<queue>.failed`. |
+| `release()` | **Republish** the updated envelope, wait for the broker's confirm if the channel is in confirm mode, then `basic_ack` the original. |
+| `deadLetter()` | Publish the annotated envelope to `<queue>.failed`, wait for the confirm likewise, then `basic_ack` the original. |
 
 ### Why retries republish
 
 RabbitMQ does not let you mutate a message body in place, and a plain
 `basic_nack(requeue=true)` would not persist the incremented `attempts` or the
-`dead_letter` block. So a retry/dead-letter **acks the original delivery and
-publishes a fresh message** carrying the updated envelope. This keeps `attempts`
-and dead-letter annotations accurate across redeliveries.
+`dead_letter` block. So a retry/dead-letter **publishes a fresh message**
+carrying the updated envelope **and only then acks the original delivery**. This
+keeps `attempts` and dead-letter annotations accurate across redeliveries.
+
+The order is deliberate. A worker that dies between the publish and the ack leaves
+a duplicate, which RabbitMQ redelivers and the dispatcher's
+[deduplication](Idempotent-Consumption.md) recognises; acking first would leave no
+message at all. If the publish throws, the original is not acked and RabbitMQ
+redelivers it. To also be safe against the broker not accepting the publish, put
+the channel in publisher-confirm mode (`$channel->confirm_select()`): the transport
+then waits (up to 30 s) for the confirm before it acks, and leaves the original
+unacked if none arrives. Without confirm mode that wait returns at once.
+
+The same path puts back a message that is **waiting for another handler's
+in-flight key** (a `release` with a delay). It lands at the tail of the queue, so
+other messages are not blocked behind it, and the worker pauses briefly after each
+such release because RabbitMQ ignores the delay.
 
 ### Delay caveat
 

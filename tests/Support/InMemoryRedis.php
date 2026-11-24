@@ -11,7 +11,10 @@ use Predis\Command\CommandInterface;
 /**
  * A tiny in-memory stand-in for a Predis client implementing just the list and
  * sorted-set commands {@see \InitPHP\Queue\Transport\Redis\RedisTransport} uses
- * (`BLMOVE`, `RPUSH`, `LREM`, `ZADD`, `ZRANGEBYSCORE`, `ZREM`). The remaining
+ * (`BLMOVE`, `RPUSH`, `LREM`, `ZADD`, `ZRANGEBYSCORE`, `ZREM`) plus an `eval()`
+ * that recognises the transport's three scripts by their leading marker comment
+ * and applies the same steps atomically (the real scripts run against Redis in
+ * the integration test). The remaining
  * {@see ClientInterface} methods are not exercised by the transport and throw.
  */
 final class InMemoryRedis implements ClientInterface
@@ -113,6 +116,49 @@ final class InMemoryRedis implements ClientInterface
         unset($this->zsets[$key][$member]);
 
         return 1;
+    }
+
+    /**
+     * Emulates EVAL for the transport's scripts only.
+     *
+     * @return int
+     */
+    public function eval(string $script, int $numKeys, string ...$args): mixed
+    {
+        $keys = array_slice($args, 0, $numKeys);
+        $argv = array_slice($args, $numKeys);
+
+        if (str_contains($script, '-- queue:release')) {
+            if ($this->lrem($keys[0], 1, $argv[0]) < 1) {
+                return 0;
+            }
+            (float) $argv[2] > 0
+                ? $this->zadd($keys[2], [$argv[1] => (float) $argv[2]])
+                : $this->rpush($keys[1], [$argv[1]]);
+
+            return 1;
+        }
+
+        if (str_contains($script, '-- queue:dead-letter')) {
+            if ($this->lrem($keys[0], 1, $argv[0]) < 1) {
+                return 0;
+            }
+            $this->rpush($keys[1], [$argv[1]]);
+
+            return 1;
+        }
+
+        if (str_contains($script, '-- queue:migrate')) {
+            $due = array_slice($this->zrangebyscore($keys[0], '-inf', $argv[0]), 0, 1000);
+            foreach ($due as $member) {
+                $this->zrem($keys[0], $member);
+                $this->rpush($keys[1], [$member]);
+            }
+
+            return count($due);
+        }
+
+        throw new BadMethodCallException('InMemoryRedis cannot evaluate this script.');
     }
 
     /**

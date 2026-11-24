@@ -51,19 +51,27 @@ observe a stop signal instead of blocking forever on an empty queue.
 
 ### Retry with delay
 
-`release()` removes the in-flight copy, then:
+`release()` runs one Lua script that removes the in-flight copy (`LREM`) and, only
+if it removed one, then:
 
 - delay `0` → `RPUSH orders <envelope>` (back onto the ready queue immediately);
 - delay `> 0` → `ZADD orders:delayed <due-time> <envelope>`.
 
-On every `reserve()`, due members of `orders:delayed` (score `<= now`) are migrated
-back onto the ready list — each re-enqueued only by the worker that wins its
-`ZREM`, so a delayed retry is never duplicated across workers.
+Because it is one script, a worker that dies cannot leave the message on no list at
+all. And because the write happens only when the `LREM` removed the worker's own
+entry, a worker that has **lost the message** (a reaper already moved it back onto
+the queue) does not add a second copy: the live copy belongs to whoever reserves it
+next, and the stale release is ignored. The same holds for `deadLetter()`.
+
+On every `reserve()`, due members of `orders:delayed` (score `<= now`, at most 1000
+at a time) are migrated back onto the ready list by another script, each member
+removed and pushed in the same step, so a delayed retry is neither lost nor
+duplicated across workers.
 
 ### Dead-letter
 
 `deadLetter()` removes the in-flight copy and `RPUSH`-es the annotated envelope
-onto `orders:failed`.
+onto `orders:failed`, in one script, and only if the worker still owns the message.
 
 ## Delivery semantics
 
@@ -72,6 +80,23 @@ At-least-once. A crashed worker leaves its in-flight message on
 then exit) avoids stranding messages in normal operation; if you run workers that
 can be killed mid-job, add a small reaper that moves long-idle
 `orders:processing` entries back onto `orders`.
+
+A message is identified by its processing entry, so a worker acts on a message
+only while that entry is still there. This is what stops a slow handler and a
+reaper from splitting one message into two, and it has two consequences for the
+reaper you write:
+
+- **Keep its delay above your slowest handler.** If a handler is still running when
+  the reaper moves its message back, the handler's later ack, retry or dead-letter
+  is ignored; the reclaimed copy is the one that carries on.
+- **Count each reclaim as an attempt**: increment `attempts` in the envelope it
+  puts back. A reclaim means one attempt did not finish, and without the count a
+  handler that always outlives the reaper and always fails would never reach
+  `maxAttempts`.
+
+With the dispatcher's [deduplication](Idempotent-Consumption.md), a reclaimed copy
+that finds the original handler's key still claimed is parked in `orders:delayed`
+and re-checked, not discarded.
 
 ## Using phpredis instead
 

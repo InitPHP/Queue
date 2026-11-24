@@ -19,6 +19,7 @@ use InitPHP\Queue\Routing\HandlerMap;
 use InitPHP\Queue\Tests\Support\ArrayTransport;
 use InitPHP\Queue\Tests\Support\ClaimOnlyIdempotencyStore;
 use InitPHP\Queue\Tests\Support\RecordingHandler;
+use InitPHP\Queue\Transport\Pdo\PdoTransport;
 use PDO;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
@@ -145,13 +146,13 @@ final class InFlightRedeliveryTest extends TestCase
 
         $transport->publish($this->payload('msg-1'), 'orders');
 
-        for ($i = 0; $i < 20; ++$i) {
+        for ($i = 0; $i < 6; ++$i) {
             $worker->runOnce('orders');
         }
 
         self::assertSame(1, $transport->readyCount('orders'), 'the message is still queued');
         self::assertSame(0, $transport->deadCount('orders'), 'waiting must not dead-letter it, even with maxAttempts 1');
-        self::assertCount(20, $transport->releases);
+        self::assertCount(6, $transport->releases);
         self::assertSame([['job.released', 'in_flight', 5]], array_slice($events, 0, 1));
 
         foreach ($transport->releases as $release) {
@@ -192,9 +193,10 @@ final class InFlightRedeliveryTest extends TestCase
         // second worker while it still runs; then the first handler throws.
         $pdo = new PDO('sqlite::memory:');
         $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-        $transport = new \InitPHP\Queue\Transport\Pdo\PdoTransport($pdo, 'jobs', null, 'default', 0); // retryAfter 0: a reservation is at once reclaimable
+        $transport = new PdoTransport($pdo, 'jobs', null, 'default', 0); // retryAfter 0: a reservation is at once reclaimable
         $transport->createSchema();
         $transport->publish($this->payload('msg-1'), 'orders');
+        $otherTransport = new PdoTransport($pdo, 'jobs', null, 'default', 0); // the second worker's own connection
 
         $store = new InMemoryIdempotencyStore();
         $options = new IdempotencyOptions($store, inFlightDelaySeconds: 5);
@@ -208,7 +210,7 @@ final class InFlightRedeliveryTest extends TestCase
             throw new RuntimeException('downstream failed');
         });
         $firstWorker = new Worker($transport, new Dispatcher($handlers, idempotency: $options), $workerOptions);
-        $secondWorker = new Worker($transport, new Dispatcher($handlers, idempotency: $options), $workerOptions);
+        $secondWorker = new Worker($otherTransport, new Dispatcher($handlers, idempotency: $options), $workerOptions);
 
         $firstWorker->runOnce('orders');
 
@@ -217,6 +219,7 @@ final class InFlightRedeliveryTest extends TestCase
         $row = $pdo->query('SELECT attempts FROM jobs')->fetchAll(PDO::FETCH_ASSOC);
         self::assertCount(1, $row, 'the message still has a row: neither a retry nor a dead letter was lost');
         self::assertSame(1, (int) $row[0]['attempts'], 'the failed attempt is counted');
+        self::assertGreaterThan(time() + 20, strtotime((string) $pdo->query('SELECT available_at FROM jobs')->fetchColumn()), 'the retry keeps its back-off, the wait did not shorten it');
         self::assertSame(0, (int) $pdo->query('SELECT COUNT(*) FROM jobs_failed')->fetchColumn());
         self::assertFalse($store->seen(self::KEY), 'the failed handler released its claim');
     }
@@ -226,7 +229,7 @@ final class InFlightRedeliveryTest extends TestCase
         // Path 1 end to end: a dead worker's claim is held while the redelivery arrives.
         $pdo = new PDO('sqlite::memory:');
         $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-        $transport = new \InitPHP\Queue\Transport\Pdo\PdoTransport($pdo, 'jobs', null, 'default', 0);
+        $transport = new PdoTransport($pdo, 'jobs', null, 'default', 0);
         $transport->createSchema();
         $transport->publish($this->payload('msg-1'), 'orders');
 
@@ -246,6 +249,95 @@ final class InFlightRedeliveryTest extends TestCase
 
         self::assertCount(1, $handler->handled);
         self::assertSame(0, (int) $pdo->query('SELECT COUNT(*) FROM jobs')->fetchColumn());
+    }
+
+    public function test_waiting_does_not_count_as_processing_or_use_up_max_jobs(): void
+    {
+        $transport = new ArrayTransport();
+        $store = new InMemoryIdempotencyStore();
+        $store->claim(self::KEY, 300);
+        $handler = new RecordingHandler();
+        $worker = new Worker(
+            $transport,
+            $this->dispatcher($handler, $store),
+            new WorkerOptions(maxJobs: 1, sleepWhenEmpty: 0.0, reserveTimeout: 0.0, maxRuntime: 1.0),
+        );
+        $transport->publish($this->payload('msg-1'), 'orders');
+        $transport->publish($this->payload('msg-2'), 'orders'); // an ordinary message behind the waiting one
+
+        $worker->run('orders');
+
+        self::assertCount(1, $handler->handled, 'maxJobs 1 was still available for the ordinary message');
+        self::assertSame(1, $worker->processedCount(), 'only the handled message is counted');
+        self::assertGreaterThan(0, count($transport->releases), 'the waiting message was deferred');
+    }
+
+    public function test_a_deferral_pauses_even_when_sleep_when_empty_is_zero(): void
+    {
+        $transport = new ArrayTransport();
+        $store = new InMemoryIdempotencyStore();
+        $store->claim(self::KEY, 300);
+        $worker = new Worker(
+            $transport,
+            $this->dispatcher(new RecordingHandler(), $store),
+            new WorkerOptions(sleepWhenEmpty: 0.0),
+        );
+        $transport->publish($this->payload('msg-1'), 'orders');
+
+        $startedAt = microtime(true);
+        $worker->runOnce('orders');
+
+        self::assertGreaterThanOrEqual(0.09, microtime(true) - $startedAt, 'a transport that ignores the delay must not be spun on');
+    }
+
+    public function test_a_stale_holder_cannot_overwrite_a_retry_recorded_by_another_worker(): void
+    {
+        // A and B both hold the row (B took over A's lapsed reservation). B records
+        // a retry; A then puts the message back unchanged.
+        $pdo = new PDO('sqlite::memory:');
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $a = new PdoTransport($pdo, 'jobs', null, 'default', 0);
+        $a->createSchema();
+        $b = new PdoTransport($pdo, 'jobs', null, 'default', 0);
+        $a->publish($this->payload('msg-1'), 'orders');
+
+        $first = $a->reserve('orders');
+        $second = $b->reserve('orders');
+        self::assertNotNull($first);
+        self::assertNotNull($second);
+
+        $envelope = $second->envelope();
+        $envelope['attempts'] = 1;
+        $b->release($second, EnvelopeCodec::encode($envelope), 60);
+        $a->release($first, $first->rawBody(), 5);
+
+        $row = $pdo->query('SELECT attempts, payload FROM jobs')->fetch(PDO::FETCH_ASSOC);
+        self::assertSame(1, (int) $row['attempts'], 'the recorded retry survives');
+        self::assertSame(1, EnvelopeCodec::decode($row['payload'])['attempts']);
+        self::assertGreaterThan(time() + 30, strtotime((string) $pdo->query('SELECT available_at FROM jobs')->fetchColumn()));
+    }
+
+    public function test_a_release_does_not_touch_a_row_another_worker_holds_now(): void
+    {
+        $pdo = new PDO('sqlite::memory:');
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $transport = new PdoTransport($pdo, 'jobs', null, 'default', 0);
+        $transport->createSchema();
+        $transport->publish($this->payload('msg-1'), 'orders');
+
+        $message = $transport->reserve('orders');
+        self::assertNotNull($message);
+
+        // Another worker took the row over later: a different reservation stamp.
+        $pdo->exec("UPDATE jobs SET reserved_at = '2999-01-01 00:00:00'");
+
+        $envelope = $message->envelope();
+        $envelope['attempts'] = 1;
+        $transport->release($message, EnvelopeCodec::encode($envelope), 30);
+
+        $row = $pdo->query('SELECT attempts, reserved_at FROM jobs')->fetch(PDO::FETCH_ASSOC);
+        self::assertSame(0, (int) $row['attempts'], 'the new holder keeps its row');
+        self::assertSame('2999-01-01 00:00:00', $row['reserved_at']);
     }
 
     public function test_the_in_flight_delay_must_be_at_least_one_second(): void

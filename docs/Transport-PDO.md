@@ -112,6 +112,17 @@ re-checked, not discarded, so the row survives until that claim is recorded,
 released or lapses. Keep `leaseSeconds` above your slowest handler — see
 [Idempotent Consumption](Idempotent-Consumption.md#choosing-leaseseconds).
 
+### Releasing a row you no longer hold
+
+A worker whose reservation has lapsed and been taken over by another worker does
+not overwrite the new holder's row. `release()` updates only a row whose
+`reserved_at` still has the stamp this transport instance wrote when it reserved
+it, or (for a retry that records a new `attempts` and back-off) one that has since
+been released; and a message put back **unchanged** (waiting for another handler)
+never rewrites `payload` or `attempts`, so it cannot undo a retry another worker has
+just recorded. The stamp has one-second resolution, so with `retryAfter: 0` two
+reservations within the same second look alike.
+
 ## Lifecycle in SQL terms
 
 | Operation | Effect |

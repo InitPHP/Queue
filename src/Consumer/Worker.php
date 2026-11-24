@@ -28,6 +28,13 @@ use Throwable;
  */
 final class Worker
 {
+    /**
+     * The shortest pause after putting a message back with a delay, so a
+     * transport that ignores the delay (RabbitMQ) cannot be spun on even with
+     * `sleepWhenEmpty: 0`.
+     */
+    private const DEFERRAL_PAUSE_SECONDS = 0.1;
+
     private bool $shouldStop = false;
 
     private int $processed = 0;
@@ -87,13 +94,17 @@ final class Worker
                 continue;
             }
 
+            $counted = true;
+
             try {
-                $this->process($message);
+                $counted = $this->process($message);
             } catch (Throwable $e) {
                 $this->log('error', 'process.failed', $this->context($message, ['error' => $e->getMessage()]));
             }
 
-            ++$this->processed;
+            if ($counted) {
+                ++$this->processed;
+            }
             $this->dispatchSignals();
         }
     }
@@ -110,8 +121,9 @@ final class Worker
             return false;
         }
 
-        $this->process($message);
-        ++$this->processed;
+        if ($this->process($message)) {
+            ++$this->processed;
+        }
 
         return true;
     }
@@ -125,14 +137,20 @@ final class Worker
     }
 
     /**
-     * Total messages processed across this worker's lifetime.
+     * Total messages processed across this worker's lifetime. A message put back
+     * to wait for another handler's in-flight key is not processing and is not
+     * counted, so waiting never uses up `maxJobs`.
      */
     public function processedCount(): int
     {
         return $this->processed;
     }
 
-    private function process(ReceivedMessage $message): void
+    /**
+     * Act on one message. Returns false when the message was only deferred (put
+     * back with a delay to wait for another handler), true when it was handled.
+     */
+    private function process(ReceivedMessage $message): bool
     {
         $outcome = $this->dispatcher->dispatch($message);
 
@@ -160,7 +178,9 @@ final class Worker
                 // Transports without native delay (RabbitMQ) hand it straight back,
                 // so pause briefly rather than reserving it again in a tight loop.
                 if ($outcome->delaySeconds > 0) {
-                    $this->sleep($this->options->sleepWhenEmpty);
+                    $this->sleep(max(self::DEFERRAL_PAUSE_SECONDS, $this->options->sleepWhenEmpty));
+
+                    return false;
                 }
 
                 break;
@@ -180,6 +200,8 @@ final class Worker
 
                 break;
         }
+
+        return true;
     }
 
     private function retry(ReceivedMessage $message, int $attempt): void

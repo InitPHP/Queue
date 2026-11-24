@@ -50,7 +50,8 @@ final class IdempotencyOptions
      *         {@see \InitPHP\Queue\Contracts\CompletionAwareIdempotencyStore}), the
      *         message is put back and not offered again for this many seconds.
      *         The redelivery consumes no attempt, so this only paces the checks;
-     *         it must be at least 1 so a waiting message cannot spin.
+     *         it must be at least 1. The worker also pauses after each
+     *         deferral, so a transport without native delay does not spin.
      *
      * @throws ConfigurationException When a numeric option is out of range.
      */

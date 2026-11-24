@@ -63,23 +63,52 @@ final class AmqpTransportTest extends TestCase
         (new AmqpTransport($channel))->ack($this->reserved($this->envelope()));
     }
 
-    public function test_release_acks_the_original_and_republishes(): void
+    public function test_release_publishes_the_new_copy_before_it_acks_the_original(): void
     {
         $channel = Mockery::mock(AMQPChannel::class);
-        $channel->shouldReceive('basic_ack')->once()->with(42);
         $channel->shouldReceive('queue_declare');
-        $channel->shouldReceive('basic_publish')->once();
+        $channel->shouldReceive('basic_publish')->once()->ordered();
+        $channel->shouldReceive('wait_for_pending_acks')->once()->ordered();
+        $channel->shouldReceive('basic_ack')->once()->with(42)->ordered();
 
         $raw = $this->envelope();
         (new AmqpTransport($channel))->release($this->reserved($raw), $raw, 0);
     }
 
-    public function test_dead_letter_acks_and_publishes_to_the_failed_queue(): void
+    public function test_a_failed_publish_leaves_the_original_unacked(): void
     {
         $channel = Mockery::mock(AMQPChannel::class);
-        $channel->shouldReceive('basic_ack')->once()->with(42);
-        $channel->shouldReceive('queue_declare')->once()->with('orders.failed', false, true, false, false);
+        $channel->shouldReceive('queue_declare');
+        $channel->shouldReceive('basic_publish')->once()->andThrow(new \RuntimeException('connection lost'));
+        $channel->shouldNotReceive('basic_ack');
+
+        $raw = $this->envelope();
+
+        $this->expectException(\RuntimeException::class);
+        (new AmqpTransport($channel))->release($this->reserved($raw), $raw, 0);
+    }
+
+    public function test_an_unconfirmed_publish_leaves_the_original_unacked(): void
+    {
+        $channel = Mockery::mock(AMQPChannel::class);
+        $channel->shouldReceive('queue_declare');
         $channel->shouldReceive('basic_publish')->once();
+        $channel->shouldReceive('wait_for_pending_acks')->once()->andThrow(new \RuntimeException('confirm timeout'));
+        $channel->shouldNotReceive('basic_ack');
+
+        $raw = $this->envelope();
+
+        $this->expectException(\RuntimeException::class);
+        (new AmqpTransport($channel))->deadLetter($this->reserved($raw), $raw);
+    }
+
+    public function test_dead_letter_publishes_to_the_failed_queue_before_it_acks(): void
+    {
+        $channel = Mockery::mock(AMQPChannel::class);
+        $channel->shouldReceive('queue_declare')->once()->with('orders.failed', false, true, false, false);
+        $channel->shouldReceive('basic_publish')->once()->ordered();
+        $channel->shouldReceive('wait_for_pending_acks')->once()->ordered();
+        $channel->shouldReceive('basic_ack')->once()->with(42)->ordered();
 
         $raw = $this->envelope();
         (new AmqpTransport($channel))->deadLetter($this->reserved($raw), $raw);

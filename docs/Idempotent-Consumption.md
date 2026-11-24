@@ -52,9 +52,27 @@ A waiting message consumes **no retry attempt**: it is released verbatim, with
 `attempts` unchanged, so it is never moved to the dead-letter queue merely for
 waiting, and the worker's `maxAttempts` and `backoff` apply only to real failures.
 It is not a tight loop either: the message is paced by `inFlightDelaySeconds`
-(honoured natively by PDO and Redis), and the worker pauses for `sleepWhenEmpty`
-after each deferral, which keeps RabbitMQ (which has no native delay) from
-reserving the same message again at once.
+(honoured natively by PDO and Redis), and after each deferral the worker pauses
+for `sleepWhenEmpty`, but never less than 0.1 s, so RabbitMQ (which has no native
+delay and hands the message straight back) is not spun on even with
+`sleepWhenEmpty: 0`. On PDO and Redis that pause is the price of a deferral for
+the messages queued behind it.
+
+A deferral is not processing: the worker does not count it towards `maxJobs` or
+`processedCount()`. Two consequences follow. A worker run with `stopWhenEmpty: true`
+(drain mode) keeps going while a waiting message is still handed back at once, which
+on RabbitMQ is until the other handler finishes or its lease lapses, and for good
+if the claim has no lease; on PDO and Redis the waiting message is parked with its
+delay, so the queue counts as empty and the worker exits. And `maxJobs` is not used
+up by waiting, so a worker whose only message is waiting does not restart over and
+over.
+
+How the message is put back is the transport's job, and it is done so that no
+step can lose it: PDO is one `UPDATE` of the row, RabbitMQ **publishes the copy
+before it acks the original** (a crash in between leaves a duplicate, which this
+layer recognises, never a missing message), and Redis does the move in one Lua
+script. See [Transport: RabbitMQ](Transport-RabbitMQ.md#why-retries-republish) and
+[Transport: Redis](Transport-Redis.md#retry-with-delay).
 
 This needs a store that can tell a recorded key from a claimed one: one that
 implements `InitPHP\Queue\Contracts\CompletionAwareIdempotencyStore`
@@ -64,9 +82,11 @@ behaviour: every failed claim is treated as a recorded duplicate and discarded.
 
 ## What deduplication does not guarantee
 
-A message is no longer lost because its first handler failed or its worker died;
-these remain. Reproduced against a real `PdoTransport`, a shared store with a
-lease, and worker processes killed with `SIGKILL`.
+A message is no longer lost because its first handler failed or its worker died
+(the two loss paths were reproduced against a real `PdoTransport`, a shared store
+with a lease, and worker processes killed with `SIGKILL`, and no longer occur);
+these remain. Items 3 to 6 follow from how the lease and the transports work and
+were not run as separate scenarios.
 
 1. **A handler can still run twice.** A worker finishes the handler and dies
    before `remember()`. The key is not recorded, so once the lease lapses the redelivery runs the
@@ -74,7 +94,8 @@ lease, and worker processes killed with `SIGKILL`.
    must stay idempotent.
 2. **A handler that outlives its lease can run twice.** If the lease lapses while
    the first handler is still running, the next redelivery wins the claim and runs
-   the same message concurrently.
+   the same message concurrently. When the first handler then throws, its
+   `forget()` also frees the newer claim, because a claim carries no owner.
 3. **A key stuck in flight keeps its message waiting.** With a lease that never
    lapses (`leaseSeconds: 0` on a store that then holds the claim forever) a dead
    worker's claim is never released, and the message is deferred again and again
@@ -82,6 +103,21 @@ lease, and worker processes killed with `SIGKILL`.
    `forget()` on the key (or a lease) frees it, so give every claim a lease.
 4. **A store without `isCompleted()` still discards.** See above: such a store
    keeps the pre-2.3 behaviour, including the message loss it had.
+5. **A handler that kills its process never counts as failed.** A message whose
+   handler is killed each time (out of memory, a fatal error) never reaches the
+   retry path, so its `attempts` stays the same and it never reaches the
+   dead-letter queue. Without deduplication it simply crashed the worker again on
+   every redelivery; with it, the message is picked up again each time the lease
+   lapses. Watch for a message that keeps appearing.
+6. **On Redis, a reaper has to count its reclaims.** Redis never redelivers a
+   message by itself; a reaper moves it from `<queue>:processing` back onto the
+   queue. If the original handler is still running (slower than the reaper's
+   delay), its eventual failure is ignored, because the message is no longer
+   its own (see [Transport: Redis](Transport-Redis.md#delivery-semantics)). The
+   retry then has to come from the reclaimed copy, so have the reaper increment
+   `attempts` in the envelope it moves back, and keep its delay above your slowest
+   handler: otherwise a handler that always runs longer than the reaper and always
+   fails is never counted against `maxAttempts`.
 
 ### Choosing `leaseSeconds`
 
@@ -95,8 +131,8 @@ being discarded.
 | Transport | When a dead worker's message comes back | Effect of the lease |
 | --- | --- | --- |
 | PDO | after `retryAfter` (default 90 s) | the redelivery is released and re-checked every `inFlightDelaySeconds` until the lease lapses, then handled |
-| Redis | when your reaper moves it from `<queue>:processing` back onto the queue (there is no automatic reclaim) | the same: it waits until the lease lapses |
-| RabbitMQ | as soon as the broker sees the connection or channel close, typically immediately | the same, re-checked about every `sleepWhenEmpty` seconds, because RabbitMQ has no native delay |
+| Redis | when your reaper moves it from `<queue>:processing` back onto the queue (there is no automatic reclaim) | the same: it waits until the lease lapses; keep the reaper's delay above your slowest handler and have it count each reclaim as an attempt |
+| RabbitMQ | as soon as the broker sees the connection or channel close, typically immediately | the same, re-checked about every `sleepWhenEmpty` seconds (at least 0.1 s), because RabbitMQ has no native delay |
 
 `leaseSeconds: 0` is not "no lease": the bundled `InMemoryIdempotencyStore` and the
 Redis store below then hold the claim with no expiry, so a dead worker's claim
@@ -116,12 +152,18 @@ Nothing has to change: `IdempotencyStore`, its method signatures and the
 - **Records written by 2.1/2.2 in a durable store** do not distinguish a claim from
   a recorded key (both were a plain row or a `1`). When you add `isCompleted()`,
   treat such a legacy record as **completed**. That is what 2.2 did, so every
-  message deduped before the upgrade is still deduped. The only exposure is a
-  claim held by a handler that was already running during the upgrade: its
-  redelivery is discarded as before until that lease lapses, which is at most
-  `leaseSeconds` (default 300 s), after which new claims are the in-flight kind.
-  Messages that need no care across the upgrade can be left alone; to be exact,
-  drain the workers before deploying.
+  message deduped before the upgrade is still deduped.
+- **Roll the upgrade out by draining first.** Stop every worker that runs 2.1/2.2
+  before the first 2.3 worker starts, and deploy the new store schema or value
+  format before it. While both versions run, the old workers still discard any
+  message whose claim they cannot get, including a claim the new workers hold
+  with the new in-flight marker, so a new worker that dies mid-handler can lose
+  its message to an old one. They also keep writing legacy claim records, which
+  the new `isCompleted()` reads as completed, so a redelivery meant to wait is
+  discarded instead. The exposure lasts until the last 2.2 worker has stopped, and
+  then for as long as the longest lease still on record: `leaseSeconds` (default
+  300 s), or forever for a claim written with `leaseSeconds: 0`, which you clear
+  with `forget()`.
 - **`InMemoryIdempotencyStore`** keeps nothing across a restart, so it has no
   legacy records.
 - **`Outcome::release()`** takes an optional second argument, `$delaySeconds`, and
@@ -238,14 +280,16 @@ if its lease has lapsed (`DELETE FROM idempotency WHERE dedup_key = ? AND expire
 then `INSERT` it with `expires_at = now + leaseSeconds` and report `true` only
 when the insert affected a row (a unique-key violation means `false`). The same
 effect in one statement is `INSERT … ON CONFLICT (dedup_key) DO UPDATE SET expires_at =
-excluded.expires_at WHERE idempotency.expires_at <= ?` (SQLite and PostgreSQL),
+excluded.expires_at, completed = 0 WHERE idempotency.expires_at <= ?` (SQLite and PostgreSQL),
 again checking the affected-row count. `remember()` upserts the row with
 `expires_at = now + ttl` (or `NULL` to keep it) and marks it completed, `forget()`
 deletes it, and `seen()` ignores rows whose `expires_at` has passed. For
-`isCompleted()` add a `completed` flag column: `claim()` inserts it as `0`,
-`remember()` sets it to `1`, and `isCompleted()` returns true for a live row whose
-flag is `1`. Give the column a default of `1`, so rows written before you added it
-read as completed.
+`isCompleted()` add a `completed` flag column: `claim()` sets it to `0`, **also when
+it takes over a lapsed row** (the one-statement form needs `completed = 0` in its
+`DO UPDATE SET` list: a takeover that keeps the old `1` makes the next redelivery
+look completed and drops the message), `remember()` sets it to
+`1`, and `isCompleted()` returns true for a live row whose flag is `1`. Give the
+column a default of `1`, so rows written before you added it read as completed.
 
 See also [Retries & Dead-Letters](Retries-and-Dead-Letters.md) and
 [Core Concepts › Delivery guarantee](Core-Concepts.md#delivery-guarantee).

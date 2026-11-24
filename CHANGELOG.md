@@ -30,9 +30,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   released back to the queue (`job.released`, reason `in_flight`) without counting
   an attempt, so it never moves towards the dead-letter queue by waiting, and it is
   re-checked after `inFlightDelaySeconds`. A recorded (completed) duplicate is
-  still dropped. The `Worker` pauses for `sleepWhenEmpty` after a delayed release so
-  that RabbitMQ, which has no native delay, does not reserve the message again in a
-  tight loop.
+  still dropped. After a delayed release the `Worker` pauses for `sleepWhenEmpty`
+  (at least 0.1 s) so that RabbitMQ, which has no native delay, does not reserve
+  the message again in a tight loop.
+- `RedisTransport::release()`, `deadLetter()` and the delayed-set migration are
+  single Lua scripts. They act only while the worker still owns the message (its
+  `LREM` removed one processing entry), so a release or dead-letter from a worker
+  whose message a reaper already moved back no longer forks it into two copies, and
+  a crash cannot leave a message on no list. Redis 6.2+ already required Lua.
+- `AmqpTransport::release()` and `deadLetter()` publish the new copy (waiting for
+  the broker's confirm when the channel is in confirm mode) **before** acking the
+  original, so a crash between the two leaves a duplicate instead of losing the
+  message, and a failed publish leaves the original unacked.
+- `PdoTransport::release()` updates only a row still held with the reservation
+  stamp it wrote, and a message put back unchanged no longer rewrites `payload`
+  or `attempts`, so a worker whose reservation was taken over cannot overwrite
+  another worker's recorded retry or back-off.
+- A message deferred to wait for an in-flight key no longer counts towards
+  `maxJobs` or `processedCount()`, and the worker pauses at least 0.1 s after a
+  deferral even with `sleepWhenEmpty: 0`.
 - Wrong docblocks: `IdempotencyStore::forget()` is called by the dispatcher when a
   handler throws, and the contract's description now lists `forget()`.
 
