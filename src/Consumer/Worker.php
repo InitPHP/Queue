@@ -313,20 +313,33 @@ final class Worker
      */
     private function pauseAfterFailure(ReceivedMessage $message): void
     {
-        $seconds = min(
+        // A monotonic clock, so a wall-clock step cannot stretch the 5 s cap.
+        $until = hrtime(true) + (int) ($this->failurePauseSeconds($message) * 1_000_000_000);
+
+        while (! $this->shouldStop && ($left = ($until - hrtime(true)) / 1_000_000_000) > 0) {
+            $this->sleep(min($left, 0.25));
+            $this->dispatchSignals();
+        }
+    }
+
+    /**
+     * How long to wait after a failure on `$message`: the larger of 0.1 s,
+     * `sleepWhenEmpty` and the back-off for its next attempt, at most 5 s.
+     */
+    private function failurePauseSeconds(ReceivedMessage $message): float
+    {
+        // Capped so an `attempts` of PHP_INT_MAX (a foreign or damaged message) cannot
+        // overflow into a float here, outside the failure handling that called us.
+        $nextAttempt = min($message->attempts(), PHP_INT_MAX - 1) + 1;
+
+        return min(
             self::FAILURE_PAUSE_CAP_SECONDS,
             max(
                 self::DEFERRAL_PAUSE_SECONDS,
                 $this->options->sleepWhenEmpty,
-                (float) $this->options->delayForAttempt($message->attempts() + 1),
+                (float) $this->options->delayForAttempt($nextAttempt),
             ),
         );
-        $until = microtime(true) + $seconds;
-
-        while (! $this->shouldStop && ($left = $until - microtime(true)) > 0) {
-            $this->sleep(min($left, 0.25));
-            $this->dispatchSignals();
-        }
     }
 
     private function sleep(float $seconds): void

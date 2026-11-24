@@ -12,6 +12,7 @@ use InitPHP\Queue\Contracts\ConsumerTransport;
 use InitPHP\Queue\Exceptions\QueueException;
 use InitPHP\Queue\Message\ReceivedMessage;
 use InitPHP\Queue\Routing\HandlerMap;
+use InitPHP\Queue\Tests\Support\ArrayTransport;
 use InitPHP\Queue\Tests\Support\RecordingHandler;
 use InitPHP\Queue\Transport\Amqp\AmqpTransport;
 use Mockery;
@@ -149,5 +150,57 @@ final class WorkerFailurePauseTest extends TestCase
 
         self::assertGreaterThanOrEqual(1, $handler->calls);
         self::assertLessThanOrEqual(8, $handler->calls, 'paced by the failure pause, not a tight loop');
+    }
+
+    /**
+     * @return float the failure pause for a message with `$attempts`
+     */
+    private function pauseFor(WorkerOptions $options, int $attempts): float
+    {
+        $worker = new Worker($this->refusingTransport($this->raw()), new Dispatcher(new HandlerMap()), $options);
+        $message = new ReceivedMessage('orders', $this->raw($attempts), EnvelopeCodec::decode($this->raw($attempts)), 1);
+
+        return (new \ReflectionMethod($worker, 'failurePauseSeconds'))->invoke($worker, $message);
+    }
+
+    public function test_the_pause_is_the_larger_of_the_floor_the_idle_sleep_and_the_back_off(): void
+    {
+        self::assertSame(0.1, $this->pauseFor(new WorkerOptions(backoff: [0], sleepWhenEmpty: 0.0), 0), 'the floor');
+        self::assertSame(2.0, $this->pauseFor(new WorkerOptions(backoff: [0], sleepWhenEmpty: 2.0), 0), 'sleepWhenEmpty');
+        self::assertSame(3.0, $this->pauseFor(new WorkerOptions(backoff: [1, 3], sleepWhenEmpty: 0.5), 1), 'the back-off for the next attempt');
+        self::assertSame(1.0, $this->pauseFor(new WorkerOptions(backoff: [1, 3], sleepWhenEmpty: 0.5), 0), 'attempt 1 uses the first back-off');
+    }
+
+    public function test_the_pause_is_capped_at_five_seconds(): void
+    {
+        self::assertSame(5.0, $this->pauseFor(new WorkerOptions(backoff: [30], sleepWhenEmpty: 0.0), 0));
+        self::assertSame(5.0, $this->pauseFor(new WorkerOptions(backoff: [0], sleepWhenEmpty: 60.0), 0));
+    }
+
+    public function test_a_message_with_the_largest_possible_attempts_does_not_crash_the_worker(): void
+    {
+        $transport = new ArrayTransport();
+        $envelope = EnvelopeCodec::make(self::URN, ['order_id' => 1], 'orders');
+        $envelope['attempts'] = PHP_INT_MAX; // a foreign or damaged message
+        $transport->publish(EnvelopeCodec::encode($envelope), 'orders');
+        $transport->publish($this->raw(), 'orders');
+
+        $handler = new RecordingHandler();
+        $handlers = (new HandlerMap())
+            ->register(self::URN, static function (\BabelQueue\Contracts\InboundMessage $message) use ($handler): void {
+                if ($message->attempts() === PHP_INT_MAX) {
+                    throw new \RuntimeException('poison');
+                }
+                $handler->handle($message);
+            });
+        $worker = new Worker(
+            $transport,
+            new Dispatcher($handlers),
+            new WorkerOptions(sleepWhenEmpty: 0.0, stopWhenEmpty: true, maxRuntime: 3.0),
+        );
+
+        $worker->run('orders');
+
+        self::assertCount(1, $handler->handled, 'the next message was still processed');
     }
 }
