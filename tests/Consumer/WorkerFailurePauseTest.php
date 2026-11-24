@@ -203,4 +203,42 @@ final class WorkerFailurePauseTest extends TestCase
 
         self::assertCount(1, $handler->handled, 'the next message was still processed');
     }
+
+    public function test_an_undocumented_back_off_shape_does_not_crash_the_worker(): void
+    {
+        // `backoff` is documented as list<int>; a map or floats must still not make
+        // the failure pause throw (2.2 logged process.failed and carried on).
+        self::assertSame(5.0, $this->pauseFor(new WorkerOptions(backoff: [1 => 5], sleepWhenEmpty: 0.0), 0), 'a map is read as its values');
+        self::assertSame(0.5, $this->pauseFor(new WorkerOptions(backoff: [0.5], sleepWhenEmpty: 0.0), 0), 'a float is kept');
+
+        // End to end with floats (a map also triggers a PHP warning in the retry path itself, as in 2.2).
+        foreach ([[0.5]] as $backoff) {
+            $transport = new ArrayTransport();
+            $transport->publish($this->raw(), 'orders');
+            $transport->publish($this->raw(), 'orders');
+            $events = [];
+            $handler = new RecordingHandler();
+            $failing = true;
+            $handlers = (new HandlerMap())->register(self::URN, static function (\BabelQueue\Contracts\InboundMessage $message) use ($handler, &$failing): void {
+                if ($failing) {
+                    $failing = false;
+                    throw new \RuntimeException('first one fails');
+                }
+                $handler->handle($message);
+            });
+            $worker = new Worker(
+                $transport,
+                new Dispatcher($handlers),
+                new WorkerOptions(backoff: $backoff, sleepWhenEmpty: 0.0, stopWhenEmpty: true, maxRuntime: 4.0),
+                function (string $level, string $event) use (&$events): void {
+                    $events[] = $event;
+                },
+            );
+
+            $worker->run('orders');
+
+            self::assertSame(1, count($handler->handled), 'the next message was still processed');
+            self::assertContains('process.failed', $events, 'the failure is logged, as in 2.2');
+        }
+    }
 }

@@ -334,12 +334,26 @@ final class Worker
 
         return min(
             self::FAILURE_PAUSE_CAP_SECONDS,
-            max(
-                self::DEFERRAL_PAUSE_SECONDS,
-                $this->options->sleepWhenEmpty,
-                (float) $this->options->delayForAttempt($nextAttempt),
-            ),
+            max(self::DEFERRAL_PAUSE_SECONDS, $this->options->sleepWhenEmpty, $this->backoffFor($nextAttempt)),
         );
+    }
+
+    /**
+     * The configured back-off for `$attempt`, read defensively: `backoff` is
+     * documented as a list of ints, but a map (`[1 => 5]`) or floats (`[0.5]`) can
+     * reach it, and the pause runs outside the failure handling, so it must not
+     * throw. Anything that is not a number counts as no back-off.
+     */
+    private function backoffFor(int $attempt): float
+    {
+        $delays = array_values($this->options->backoff);
+        if ($delays === []) {
+            return 0.0;
+        }
+
+        $delay = $delays[min(max($attempt, 1) - 1, count($delays) - 1)];
+
+        return is_int($delay) || is_float($delay) ? (float) $delay : 0.0;
     }
 
     private function sleep(float $seconds): void
