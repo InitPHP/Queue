@@ -4,7 +4,7 @@ All notable changes to `initphp/queue` are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.3.0] - 2026-11-25
 
 ### Added
 
@@ -76,6 +76,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is discarded as a duplicate); implement `CompletionAwareIdempotencyStore` to get
   the fix. Records written by 2.1/2.2 should be treated as completed by that
   method; see the upgrade notes in `docs/Idempotent-Consumption.md`.
+
+### Documentation
+
+- New [Idempotent Consumption](docs/Idempotent-Consumption.md) page, linked from
+  the README, Core Concepts, FAQ, Retries and Dead Letters and the sidebar. It
+  states that deduplication is not exactly-once delivery and does not replace an
+  idempotent handler, explains the claim lease, the in-flight release and what is
+  not guaranteed, and carries the upgrade notes for this release.
+- The README, The Worker, Transport PDO and Troubleshooting pages were updated to
+  match.
 
 ## [2.2.0] - 2026-11-22
 
