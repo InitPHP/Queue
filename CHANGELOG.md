@@ -84,6 +84,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   states that deduplication is not exactly-once delivery and does not replace an
   idempotent handler, explains the claim lease, the in-flight release and what is
   not guaranteed, and carries the upgrade notes for this release.
+- The API reference documents `IdempotencyOptions`, `IdempotencyStore`,
+  `CompletionAwareIdempotencyStore`, `InMemoryIdempotencyStore` and
+  `Outcome::release($reason, $delaySeconds)`.
+- Transport RabbitMQ explains that `release()` and `deadLetter()` publish first and
+  ack the original afterwards, how publisher-confirm mode (`confirm_select()`)
+  protects against a broker that refuses the copy, and what happens to the message
+  then. Transport Redis documents the single-script `release()`, `deadLetter()`
+  and delayed-set migration, how a worker that lost its message replaces the live
+  copy, the command-by-command path used when `EVAL` is unavailable, and what a
+  reaper must keep in mind.
 - The README, The Worker, Transport PDO and Troubleshooting pages were updated to
   match.
 
