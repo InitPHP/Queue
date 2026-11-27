@@ -25,11 +25,38 @@ The delay between attempts comes from `WorkerOptions::$backoff`
 > (a delayed sorted set). RabbitMQ retries immediately unless you install the
 > delayed-message-exchange plugin — see [Transport: RabbitMQ](Transport-RabbitMQ.md).
 
+## A handler that kills its process
+
+A handler that is killed (out of memory, `exit`, `SIGKILL`) never throws, so the
+worker never learns that it failed. The transport does: the message comes back
+because its reservation lapsed, or the broker or your reaper returned it. A
+delivery that ended without an ack, a release or a dead-letter counts as **one
+attempt**, recorded by the transport before it hands the message out again. If that
+brings `attempts` to `maxAttempts`, the worker dead-letters the message with reason
+`failed` and does not run the handler again.
+
+| Transport | How the unfinished delivery is found | Counted |
+| --------- | ------------------------------------ | ------- |
+| PDO | a row that is still stamped `reserved_at` when its reservation lapses (`retryAfter`) | every one, in the same `UPDATE` that takes the row |
+| Redis | the body is back on the queue while its `<queue>:started` entry is still there | every one, in the body and in the processing entry |
+| RabbitMQ | the broker's `redelivered` flag | **one**: classic queues keep no delivery count and the unacked body cannot be rewritten, so a handler that kills its process on every delivery is counted once, not once per crash |
+
+A message put back without an outcome of its own, such as one waiting for another
+handler's [in-flight key](Idempotent-Consumption.md), has its reservation cleared by
+`release()` and is not counted, however many times it waits. A normal failure is not
+counted twice either: the unfinished delivery and the failure that follows it are two
+different deliveries.
+
+A handler that outlives `retryAfter` (PDO) or the delay of your Redis reaper while
+its worker is alive looks like a dead one: the second delivery is counted. Keep both
+above your slowest handler.
+
 ## When a message is dead-lettered
 
 | Cause | Reason in the `dead_letter` block |
 | ----- | --------------------------------- |
 | Exhausted retries — a handler kept throwing until `attempts` reached `maxAttempts` | `failed` |
+| Exhausted deliveries — a handler's process died until `attempts` reached `maxAttempts` (see [above](#a-handler-that-kills-its-process)) | `failed` |
 | Malformed / poison envelope (missing URN, non-object `data`, bad `attempts`) | an `EnvelopeValidator::REASON_*` value |
 | Unsupported `meta.schema_version` (a newer producer) — **quarantined, never dropped** | `unsupported_schema_version` |
 | Unknown URN with the `DEAD_LETTER` strategy (or `FAIL` after retries) | `unknown_urn` |

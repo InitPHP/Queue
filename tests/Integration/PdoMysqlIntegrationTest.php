@@ -71,4 +71,27 @@ final class PdoMysqlIntegrationTest extends TestCase
         self::assertSame(0, $this->rowCount(self::TABLE));
         self::assertSame(1, $this->rowCount(self::TABLE . '_failed'));
     }
+
+    public function test_a_lapsed_reservation_is_counted_as_an_attempt(): void
+    {
+        $transport = new PdoTransport($this->pdo, self::TABLE, null, 'default', 0); // a reservation lapses at once
+        $transport->publish(EnvelopeCodec::encode(EnvelopeCodec::make('urn:babel:orders:created', ['order_id' => 5], 'orders')), 'orders');
+
+        $first = $transport->reserve('orders');
+        self::assertNotNull($first);
+        self::assertFalse($first->wasAbandoned());
+
+        $second = $transport->reserve('orders'); // the first worker never reported an outcome
+        self::assertNotNull($second);
+        self::assertTrue($second->wasAbandoned());
+        self::assertSame(1, $second->attempts());
+        self::assertSame(1, (int) $this->pdo->query('SELECT attempts FROM ' . self::TABLE)->fetchColumn());
+        self::assertSame(1, EnvelopeCodec::decode((string) $this->pdo->query('SELECT payload FROM ' . self::TABLE)->fetchColumn())['attempts']);
+
+        $transport->release($second, $second->rawBody(), 0); // put back verbatim, as an in-flight wait does
+        $third = $transport->reserve('orders');
+        self::assertNotNull($third);
+        self::assertFalse($third->wasAbandoned(), 'a released message is not counted');
+        self::assertSame(1, $third->attempts());
+    }
 }

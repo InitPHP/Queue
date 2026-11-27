@@ -10,6 +10,7 @@ use BabelQueue\Transport\RedisTransport as BabelRedisTransport;
 use BadMethodCallException;
 use Error;
 use InitPHP\Queue\Contracts\ConsumerTransport;
+use InitPHP\Queue\Message\AbandonedDelivery;
 use InitPHP\Queue\Message\ReceivedMessage;
 use Predis\ClientInterface;
 use Predis\Response\ServerException;
@@ -42,15 +43,29 @@ use Throwable;
  * transport falls back to issuing the same steps as separate commands, with the
  * same ownership rules but without atomicity.
  *
+ * A handler that kills its process (OOM, `exit`, SIGKILL) never reports a failure,
+ * and the receipt is the message body itself, so the body cannot carry the fact
+ * that it was started. `reserve()` therefore records each delivery in a
+ * `<queue>:started` sorted set keyed by the SHA-1 of the body, and `ack()`,
+ * `release()` and `deadLetter()` remove it. A body that comes back to `reserve()`
+ * with its entry still present was started and never finished (your reaper moved
+ * it from `<queue>:processing` back to the queue): that delivery is counted by
+ * raising `attempts` in the body, in the processing entry too, so the count survives
+ * the next crash and `maxAttempts` ends the message. Nothing about the body format
+ * changes and a worker on an older version simply does not take part; entries
+ * older than a week are pruned. A client that lacks the sorted-set commands this
+ * uses is not an error: the tracking is switched off and `reserve()` behaves as before.
+ *
  * Requires Redis 6.2+ (for `BLMOVE`; Lua scripting is built in). Optional
  * dependency: `predis/predis`.
  */
 final class RedisTransport implements Transport, ConsumerTransport
 {
     /**
-     * KEYS: processing, queue, delayed. ARGV: receipt, payload, due time (0 = now).
-     * Takes the worker's own processing entry, or else the live copy (parked in
-     * the delayed set, or on the queue), and puts the new payload in its place.
+     * KEYS: processing, queue, delayed, started. ARGV: receipt, payload, due time
+     * (0 = now), started-set member. Takes the worker's own processing entry, or
+     * else the live copy (parked in the delayed set, or on the queue), and puts the
+     * new payload in its place; the delivery is no longer started.
      */
     private const RELEASE_SCRIPT = <<<'LUA'
         -- queue:release
@@ -59,6 +74,7 @@ final class RedisTransport implements Transport, ConsumerTransport
                 return 0
             end
         end
+        redis.call('ZREM', KEYS[4], ARGV[4])
         if tonumber(ARGV[3]) > 0 then
             redis.call('ZADD', KEYS[3], ARGV[3], ARGV[2])
         else
@@ -68,7 +84,8 @@ final class RedisTransport implements Transport, ConsumerTransport
         LUA;
 
     /**
-     * KEYS: processing, failed, delayed, queue. ARGV: receipt, payload.
+     * KEYS: processing, failed, delayed, queue, started. ARGV: receipt, payload,
+     * started-set member.
      */
     private const DEAD_LETTER_SCRIPT = <<<'LUA'
         -- queue:dead-letter
@@ -77,7 +94,24 @@ final class RedisTransport implements Transport, ConsumerTransport
                 return 0
             end
         end
+        redis.call('ZREM', KEYS[5], ARGV[3])
         redis.call('RPUSH', KEYS[2], ARGV[2])
+        return 1
+        LUA;
+
+    /**
+     * KEYS: processing, started. ARGV: old body, new body, old member, new member,
+     * now. Swaps the processing entry for the body with the counted attempt and moves
+     * the started-set entry with it. Returns 0 when the entry is no longer there.
+     */
+    private const COUNT_SCRIPT = <<<'LUA'
+        -- queue:count-abandoned
+        if redis.call('LINSERT', KEYS[1], 'AFTER', ARGV[1], ARGV[2]) <= 0 then
+            return 0
+        end
+        redis.call('LREM', KEYS[1], 1, ARGV[1])
+        redis.call('ZREM', KEYS[2], ARGV[3])
+        redis.call('ZADD', KEYS[2], ARGV[5], ARGV[4])
         return 1
         LUA;
 
@@ -95,10 +129,21 @@ final class RedisTransport implements Transport, ConsumerTransport
         return #due
         LUA;
 
+    /** Seconds a started-set entry is kept before it is pruned (nobody reaped the message by then). */
+    private const STARTED_TTL = 604800;
+
+    /** The started set is pruned once per this many reservations. */
+    private const PRUNE_EVERY = 100;
+
     private readonly BabelRedisTransport $publisher;
 
     /** Whether the client can EVAL; cleared the first time it proves it cannot. */
     private bool $scripting = true;
+
+    /** Whether the client has the sorted-set commands delivery tracking needs; cleared when it proves it has not. */
+    private bool $tracking = true;
+
+    private int $reservations = 0;
 
     public function __construct(
         private readonly ClientInterface $client,
@@ -106,6 +151,7 @@ final class RedisTransport implements Transport, ConsumerTransport
         private readonly string $processingSuffix = ':processing',
         private readonly string $failedSuffix = ':failed',
         private readonly string $delayedSuffix = ':delayed',
+        private readonly string $startedSuffix = ':started',
     ) {
         $this->publisher = new BabelRedisTransport($client, $defaultQueue);
     }
@@ -133,14 +179,15 @@ final class RedisTransport implements Transport, ConsumerTransport
             return null;
         }
 
-        $raw = (string) $reserved;
+        [$raw, $abandoned] = $this->markStarted($queue, (string) $reserved);
 
-        return new ReceivedMessage($queue, $raw, EnvelopeCodec::decode($raw), $raw);
+        return new ReceivedMessage($queue, $raw, EnvelopeCodec::decode($raw), $raw, $abandoned);
     }
 
     public function ack(ReceivedMessage $message): void
     {
         $this->client->lrem($message->queue() . $this->processingSuffix, 1, (string) $message->receipt());
+        $this->clearStarted($message);
     }
 
     public function release(ReceivedMessage $message, string $payload, int $delaySeconds = 0): void
@@ -151,7 +198,8 @@ final class RedisTransport implements Transport, ConsumerTransport
         $receipt = (string) $message->receipt();
         $due = $delaySeconds > 0 ? time() + $delaySeconds : 0;
 
-        if ($this->evaluate(self::RELEASE_SCRIPT, [$processing, $queue, $delayed], [$receipt, $payload, (string) $due])) {
+        $args = [$receipt, $payload, (string) $due, sha1($receipt)];
+        if ($this->evaluate(self::RELEASE_SCRIPT, [$processing, $queue, $delayed, $queue . $this->startedSuffix], $args) !== null) {
             return;
         }
 
@@ -159,6 +207,7 @@ final class RedisTransport implements Transport, ConsumerTransport
         if (! $this->takeOwnership($processing, $delayed, $queue, $receipt)) {
             return;
         }
+        $this->clearStarted($message);
 
         if ($due > 0) {
             $this->client->zadd($delayed, [$payload => $due]);
@@ -177,33 +226,121 @@ final class RedisTransport implements Transport, ConsumerTransport
         $delayed = $queue . $this->delayedSuffix;
         $receipt = (string) $message->receipt();
 
-        if ($this->evaluate(self::DEAD_LETTER_SCRIPT, [$processing, $failed, $delayed, $queue], [$receipt, $payload])) {
+        $keys = [$processing, $failed, $delayed, $queue, $queue . $this->startedSuffix];
+        if ($this->evaluate(self::DEAD_LETTER_SCRIPT, $keys, [$receipt, $payload, sha1($receipt)]) !== null) {
             return;
         }
 
         if ($this->takeOwnership($processing, $delayed, $queue, $receipt)) {
+            $this->clearStarted($message);
             $this->client->rpush($failed, [$payload]);
         }
     }
 
     /**
-     * Run one of the scripts. Returns false (without having done anything) when the
-     * client cannot evaluate scripts, so the caller can take the command-by-command
-     * path; any other failure, such as a lost connection, is rethrown.
+     * Record that the delivery just taken is being started and, when the same body
+     * was already recorded as started and never finished, count that earlier
+     * delivery: the body (and its processing entry) is replaced by one with
+     * `attempts` raised by one. Returns the body to hand out and whether it was
+     * counted. A failure here must not stop consumption, so a client without the
+     * commands only turns the tracking off.
+     *
+     * @return array{0: string, 1: bool}
+     */
+    private function markStarted(string $queue, string $raw): array
+    {
+        if (! $this->tracking) {
+            return [$raw, false];
+        }
+
+        $started = $queue . $this->startedSuffix;
+        $now = time();
+
+        try {
+            if (++$this->reservations % self::PRUNE_EVERY === 1) {
+                $this->client->zremrangebyscore($started, '-inf', (string) ($now - self::STARTED_TTL));
+            }
+
+            // ZADD answers 1 for a new member, 0 for one that was there: a body
+            // started before and never finished.
+            $unfinished = (int) $this->client->zadd($started, [sha1($raw) => $now]) === 0;
+            if (! $unfinished) {
+                return [$raw, false];
+            }
+
+            $counted = AbandonedDelivery::countedBody($raw);
+            if ($counted === null) {
+                return [$raw, false];
+            }
+
+            return $this->swapProcessingEntry($queue, $raw, $counted, $now) ? [$counted, true] : [$raw, false];
+        } catch (BadMethodCallException|Error) {
+            $this->tracking = false;
+
+            return [$raw, false];
+        }
+    }
+
+    /**
+     * Replace the worker's processing entry `$raw` with `$counted` and move the
+     * started-set entry with it, so the count survives the next crash. False when the
+     * entry is gone (a reaper moved it back in the meantime).
+     */
+    private function swapProcessingEntry(string $queue, string $raw, string $counted, int $now): bool
+    {
+        $processing = $queue . $this->processingSuffix;
+        $started = $queue . $this->startedSuffix;
+        $args = [$raw, $counted, sha1($raw), sha1($counted), (string) $now];
+
+        $swapped = $this->evaluate(self::COUNT_SCRIPT, [$processing, $started], $args);
+        if ($swapped !== null) {
+            return $swapped === 1;
+        }
+
+        if ((int) $this->client->linsert($processing, 'AFTER', $raw, $counted) <= 0) {
+            return false;
+        }
+        $this->client->lrem($processing, 1, $raw);
+        $this->client->zrem($started, sha1($raw));
+        $this->client->zadd($started, [sha1($counted) => $now]);
+
+        return true;
+    }
+
+    /**
+     * Forget the started-set entry of a delivery that has an outcome. Best effort: an
+     * entry that stays is pruned after a week and costs nothing else.
+     */
+    private function clearStarted(ReceivedMessage $message): void
+    {
+        if (! $this->tracking) {
+            return;
+        }
+
+        try {
+            $this->client->zrem($message->queue() . $this->startedSuffix, sha1((string) $message->receipt()));
+        } catch (BadMethodCallException|Error) {
+            $this->tracking = false;
+        }
+    }
+
+    /**
+     * Run one of the scripts and return its integer result. Returns null (without
+     * having done anything) when the client cannot evaluate scripts, so the caller
+     * can take the command-by-command path; any other failure, such as a lost
+     * connection, is rethrown.
      *
      * @param  list<string>  $keys
      * @param  list<string>  $args
      */
-    private function evaluate(string $script, array $keys, array $args): bool
+    private function evaluate(string $script, array $keys, array $args): ?int
     {
         if (! $this->scripting) {
-            return false;
+            return null;
         }
 
         try {
-            $this->client->eval($script, count($keys), ...$keys, ...$args);
-
-            return true;
+            return (int) $this->client->eval($script, count($keys), ...$keys, ...$args);
         } catch (Throwable $e) {
             if (! $this->isScriptingUnavailable($e)) {
                 throw $e;
@@ -211,7 +348,7 @@ final class RedisTransport implements Transport, ConsumerTransport
 
             $this->scripting = false;
 
-            return false;
+            return null;
         }
     }
 
@@ -255,7 +392,7 @@ final class RedisTransport implements Transport, ConsumerTransport
     {
         $delayed = $queue . $this->delayedSuffix;
 
-        if ($this->evaluate(self::MIGRATE_SCRIPT, [$delayed, $queue], [(string) time()])) {
+        if ($this->evaluate(self::MIGRATE_SCRIPT, [$delayed, $queue], [(string) time()]) !== null) {
             return;
         }
 

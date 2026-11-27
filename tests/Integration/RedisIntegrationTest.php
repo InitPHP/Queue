@@ -44,6 +44,7 @@ final class RedisIntegrationTest extends TestCase
             self::QUEUE . ':processing',
             self::QUEUE . ':failed',
             self::QUEUE . ':delayed',
+            self::QUEUE . ':started',
         );
         $this->transport = new RedisTransport($this->client, 'default');
     }
@@ -190,5 +191,56 @@ final class RedisIntegrationTest extends TestCase
         self::assertSame(1, $this->copies());
         self::assertSame(1, (int) $this->client->zcard(self::QUEUE . ':delayed'));
         self::assertSame(0, (int) $this->client->llen(self::QUEUE . ':processing'));
+    }
+
+    public function test_a_delivery_that_never_finished_is_counted_and_ends_at_max_attempts(): void
+    {
+        $this->transport->publish(EnvelopeCodec::encode(EnvelopeCodec::make('urn:babel:orders:created', ['n' => 1], self::QUEUE)), self::QUEUE);
+
+        // Three deliveries whose handler died; the reaper puts the entry back each time.
+        foreach ([0, 1, 2] as $expected) {
+            $message = $this->transport->reserve(self::QUEUE, 1.0);
+            self::assertNotNull($message);
+            self::assertSame($expected, $message->attempts());
+            self::assertSame($expected > 0, $message->wasAbandoned());
+            self::assertSame(
+                $expected,
+                EnvelopeCodec::decode((string) $this->client->lindex(self::QUEUE . ':processing', 0))['attempts'],
+                'the processing entry carries the count',
+            );
+
+            $this->client->lrem(self::QUEUE . ':processing', 1, (string) $message->receipt());
+            $this->client->rpush(self::QUEUE, [(string) $message->receipt()]);
+        }
+
+        $handler = new RecordingHandler();
+        $worker = new Worker(
+            $this->transport,
+            new Dispatcher((new HandlerMap())->register('urn:babel:orders:created', $handler)),
+            new WorkerOptions(maxAttempts: 3, sleepWhenEmpty: 0.0, reserveTimeout: 1.0),
+        );
+        $worker->runOnce(self::QUEUE);
+
+        self::assertSame([], $handler->handled);
+        self::assertSame(0, (int) $this->client->llen(self::QUEUE . ':processing'));
+        self::assertSame(1, (int) $this->client->llen(self::QUEUE . ':failed'));
+        self::assertSame(0, (int) $this->client->zcard(self::QUEUE . ':started'));
+    }
+
+    public function test_a_message_put_back_verbatim_is_not_counted_when_reserved_again(): void
+    {
+        $this->transport->publish(EnvelopeCodec::encode(EnvelopeCodec::make('urn:babel:orders:created', ['n' => 1], self::QUEUE)), self::QUEUE);
+
+        $message = $this->transport->reserve(self::QUEUE, 1.0);
+        self::assertNotNull($message);
+        $this->transport->release($message, $message->rawBody(), 0);
+
+        $again = $this->transport->reserve(self::QUEUE, 1.0);
+        self::assertNotNull($again);
+        self::assertFalse($again->wasAbandoned());
+        self::assertSame(0, $again->attempts());
+
+        $this->transport->ack($again);
+        self::assertSame(0, (int) $this->client->zcard(self::QUEUE . ':started'));
     }
 }

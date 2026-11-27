@@ -222,12 +222,17 @@ is discarded.
    before `remember()` leaves no record; once the lease lapses the redelivery runs
    the handler again. This is not "at most once".
 2. **A handler that outlives its lease can run twice**, because a second worker
-   then wins the claim.
+   then wins the claim. With a store that implements `OwnershipAwareIdempotencyStore`
+   its later failure releases only its own claim; with one that does not, the
+   failure's `forget()` can delete the newer claim or the completed record.
 3. **A claim that never lapses keeps its message waiting.** Give every claim a
    lease; `leaseSeconds: 0` holds it until `forget()`.
-4. **A handler that kills its process never counts as failed**, so its `attempts`
-   does not rise and it never reaches the dead-letter queue; it is picked up again
-   each time the lease lapses.
+4. **A handler that kills its process is counted by the transport.** It never
+   reports a failure, so when the transport hands the message out again it counts
+   that unfinished delivery as one attempt, and the worker dead-letters the message
+   at `maxAttempts` without running the handler. PDO and Redis count every one;
+   RabbitMQ counts one (no delivery count on a classic queue). Waiting for an
+   in-flight key is never counted. See `docs/Retries-and-Dead-Letters.md`.
 5. **On Redis, a reaper that rewrites the envelope hides the late failure.** A
    handler that outlives the reaper still has its failure counted (it replaces the
    reclaimed copy, so `maxAttempts` ends the message), but only while the copy has

@@ -28,7 +28,8 @@ exactly as before — this is fully backward-compatible.
 dedup key from the message and *claims* it in the store, holding the claim under a
 lease (`leaseSeconds`). If the claim succeeds the handler runs; when it returns,
 the key is **recorded** (`remember()`, kept for `ttl` seconds); when it throws,
-the claim is released (`forget()`), so the normal retry runs it again.
+the claim is released (`forget()`, or `forgetOwned()` with the claim's token on a
+store that [tracks ownership](#claim-ownership)), so the normal retry runs it again.
 
 If the claim fails, one of two things is true:
 
@@ -94,8 +95,11 @@ were not run as separate scenarios.
    must stay idempotent.
 2. **A handler that outlives its lease can run twice.** If the lease lapses while
    the first handler is still running, the next redelivery wins the claim and runs
-   the same message concurrently. When the first handler then throws, its
-   `forget()` also frees the newer claim, because a claim carries no owner.
+   the same message concurrently. On a store that implements
+   `OwnershipAwareIdempotencyStore` the first handler's later failure releases only
+   its own claim, so the newer claim and a completed record stay. On a store that
+   does not, its `forget()` also frees the newer claim, or deletes the completed
+   record, because the claim carries no owner (see [Claim ownership](#claim-ownership)).
 3. **A key stuck in flight keeps its message waiting.** With a lease that never
    lapses (`leaseSeconds: 0` on a store that then holds the claim forever) a dead
    worker's claim is never released, and the message is deferred again and again
@@ -103,12 +107,15 @@ were not run as separate scenarios.
    `forget()` on the key (or a lease) frees it, so give every claim a lease.
 4. **A store without `isCompleted()` still discards.** See above: such a store
    keeps the pre-2.3 behaviour, including the message loss it had.
-5. **A handler that kills its process never counts as failed.** A message whose
-   handler is killed each time (out of memory, a fatal error) never reaches the
-   retry path, so its `attempts` stays the same and it never reaches the
-   dead-letter queue. Without deduplication it simply crashed the worker again on
-   every redelivery; with it, the message is picked up again each time the lease
-   lapses. Watch for a message that keeps appearing.
+5. **A handler that kills its process is counted by the transport, not by the
+   worker.** A handler that is killed (out of memory, `exit`, `SIGKILL`) never
+   reports a failure. When the transport hands such a message out again, it counts
+   that unfinished delivery as one attempt, and the worker dead-letters the message
+   (reason `failed`) once the count reaches `maxAttempts`, without running the
+   handler again. This does not touch waiting: a message put back for an in-flight
+   key is released, not abandoned, and is never counted. PDO and Redis count every
+   unfinished delivery, RabbitMQ counts one (it keeps no delivery count on a classic
+   queue); see [Retries & Dead-Letters](Retries-and-Dead-Letters.md#a-handler-that-kills-its-process).
 6. **On Redis, a reaper that rewrites the envelope hides the late failure.** Redis
    never redelivers a message by itself; a reaper moves it from
    `<queue>:processing` back onto the queue. If the original handler is still
@@ -117,8 +124,11 @@ were not run as separate scenarios.
    [Transport: Redis](Transport-Redis.md#delivery-semantics)). That only works while
    the copy still has the body the handler was given: a reaper that rewrites it
    (to increment `attempts`, say) makes the late failure unmatchable, and only the
-   reaper's own count applies. A client without `EVAL` keeps the same rules but can
-   lose a message to a crash in the middle of a retry.
+   reaper's own count applies. The same holds for the count of a delivery that never
+   finished (item 5): the transport raises `attempts` in the body it hands out, and
+   that count is kept only while the reaper moves the body back unchanged. A client
+   without `EVAL` keeps the same rules but can lose a message to a crash in the
+   middle of a retry.
 
 ### Choosing `leaseSeconds`
 
@@ -139,6 +149,57 @@ being discarded.
 Redis store below then hold the claim with no expiry, so a dead worker's claim
 never lapses. `InMemoryIdempotencyStore` lives and dies with its worker, so it
 has no orphaned claim, but it also remembers nothing across a restart.
+
+## Claim ownership
+
+`forget()` removes whatever is stored under the key. A handler that outlives its
+lease and then throws would therefore delete the claim, or the completed record, of
+the worker that took the key over, and the message would run again. A store that
+implements `InitPHP\Queue\Contracts\OwnershipAwareIdempotencyStore` avoids this:
+
+- `claimOwned(string $key, int $leaseSeconds = 0): ?string` takes the claim like
+  `claim()` and returns an opaque token that identifies it (`null` when the claim was
+  not won);
+- `forgetOwned(string $key, string $token): void` releases the claim **only if** the
+  token still owns the key, in one atomic step. A claim another worker took over, or
+  a key that has since been recorded, is left alone.
+
+The dispatcher uses these two instead of `claim()` and `forget()` when the store
+implements the interface, and only for releasing a failed handler's claim:
+`remember()` is unchanged. The interface is optional and independent of
+`CompletionAwareIdempotencyStore`; a store may implement either or both, and a store
+that implements neither keeps using `claim()` and `forget()` exactly as before.
+`claim()`, `remember()` and `forget()` must keep working on a store that adds it.
+`InMemoryIdempotencyStore` implements it. A durable example is in
+[Bring your own store](#bring-your-own-store).
+
+## Upgrading from 2.3
+
+Nothing has to change: no signature of `IdempotencyStore`,
+`CompletionAwareIdempotencyStore`, `ConsumerTransport` or `Handler` changed, the
+message body format is unchanged, and `ReceivedMessage` has a new optional last
+constructor argument.
+
+- **Ownership is opt-in.** A custom store keeps `claim()` and `forget()` until you
+  implement `OwnershipAwareIdempotencyStore`. For a Redis store, store the token as
+  the claim's value and release with a compare-and-delete script. For a PDO store,
+  add a nullable `claim_token` column that `claim()` sets (also when it takes over a
+  lapsed row), that `remember()` clears, and `DELETE … WHERE dedup_key = ? AND
+  claim_token = ?` in `forgetOwned()`.
+- **The count of unfinished deliveries needs no schema change.** PDO reuses
+  `reserved_at`, Redis adds a `<queue>:started` sorted set, RabbitMQ reads the
+  broker's `redelivered` flag. Rows and messages left by 2.3 are counted like any
+  other the first time a 2.4 worker takes them over.
+- **Rolling deploys are safe in both directions.** A 2.3 worker does not count an
+  unfinished delivery, so such a delivery is only counted while a 2.4 worker is the
+  one that takes it over (on Redis, only if a 2.4 worker reserved it first and left
+  its started entry). A 2.3 worker reading a row or message that a 2.4 worker
+  counted sees an ordinary `attempts` and the usual body. Deploying all workers gives
+  the full behaviour; none has to be drained.
+- **`retryAfter` and your Redis reaper now matter for `attempts`.** A handler that
+  runs longer than `retryAfter` (PDO) or than your reaper's delay (Redis) while its
+  worker is alive is indistinguishable from one that died, so the second delivery is
+  counted. Keep both above your slowest handler, as before.
 
 ## Upgrading from 2.1 and 2.2
 
@@ -272,6 +333,42 @@ final class RedisIdempotencyStore implements CompletionAwareIdempotencyStore
 `CompletionAwareIdempotencyStore` extends `IdempotencyStore`; the one method it adds,
 `isCompleted()`, is what lets the dispatcher keep an in-flight message instead of
 discarding it. Without it a store still works, with the 2.2 behaviour.
+
+To also stop a late failure from releasing a claim that is no longer yours, add
+`OwnershipAwareIdempotencyStore` (see [Claim ownership](#claim-ownership)). On Redis,
+keep the token as the claim's value and compare it in a script:
+
+```php
+use InitPHP\Queue\Contracts\CompletionAwareIdempotencyStore;
+use InitPHP\Queue\Contracts\OwnershipAwareIdempotencyStore;
+
+final class OwnedRedisIdempotencyStore implements CompletionAwareIdempotencyStore, OwnershipAwareIdempotencyStore
+{
+    // seen(), claim(), isCompleted(), remember() and forget() as above, with one
+    // change: isCompleted() must treat a value that starts with 'claimed:' as in flight.
+
+    public function claimOwned(string $key, int $leaseSeconds = 0): ?string
+    {
+        $token = bin2hex(random_bytes(16));
+        $options = ['NX'];
+        if ($leaseSeconds > 0) {
+            $options['EX'] = $leaseSeconds;
+        }
+
+        return $this->redis->set($key, 'claimed:' . $token, $options) ? $token : null;
+    }
+
+    public function forgetOwned(string $key, string $token): void
+    {
+        // Compare and delete in one step: only the claim that carries our token goes.
+        $this->redis->eval(
+            "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0",
+            [$key, 'claimed:' . $token],
+            1,
+        );
+    }
+}
+```
 
 A PDO-backed store needs one more step than the Redis one, because a unique
 constraint does not expire rows by itself. Redis `EX` frees a lapsed claim on its

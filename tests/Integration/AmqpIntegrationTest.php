@@ -150,4 +150,25 @@ final class AmqpIntegrationTest extends TestCase
         self::assertCount(1, $handler->handled);
         self::assertNull($this->transport->reserve(self::QUEUE, 1.0));
     }
+
+    public function test_a_delivery_that_was_never_acked_is_counted_when_the_broker_redelivers_it(): void
+    {
+        $this->transport->publish(
+            EnvelopeCodec::encode(EnvelopeCodec::make('urn:babel:orders:created', ['order_id' => 1], self::QUEUE)),
+            self::QUEUE,
+        );
+
+        $first = $this->transport->reserve(self::QUEUE, 2.0);
+        self::assertNotNull($first);
+        self::assertFalse($first->wasAbandoned());
+        self::assertSame(0, $first->attempts());
+
+        $this->channel->basic_recover(true); // the unacked delivery goes back to the queue
+
+        $second = $this->transport->reserve(self::QUEUE, 2.0);
+        self::assertNotNull($second);
+        self::assertTrue($second->wasAbandoned());
+        self::assertSame(1, $second->attempts());
+        $this->transport->ack($second);
+    }
 }

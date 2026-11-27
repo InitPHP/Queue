@@ -10,6 +10,7 @@ use BabelQueue\Validation\EnvelopeValidator;
 use InitPHP\Queue\Contracts\CompletionAwareIdempotencyStore;
 use InitPHP\Queue\Contracts\Handler;
 use InitPHP\Queue\Contracts\HandlerResolver;
+use InitPHP\Queue\Contracts\OwnershipAwareIdempotencyStore;
 use InitPHP\Queue\Exceptions\ConfigurationException;
 use InitPHP\Queue\Message\ReceivedMessage;
 use Throwable;
@@ -31,7 +32,8 @@ use Throwable;
  * whose key is only claimed by a handler that has not finished is not dropped
  * (when the store is a {@see CompletionAwareIdempotencyStore}): it is put back
  * on the queue, so the message survives that handler failing or its worker
- * dying. With no options (the default) the dispatcher behaves exactly as before.
+ * dying. A store that is an {@see OwnershipAwareIdempotencyStore} also releases a
+ * failed handler's claim only if the handler still owns it. With no options (the default) the dispatcher behaves exactly as before.
  */
 final class Dispatcher
 {
@@ -90,17 +92,38 @@ final class Dispatcher
         $idempotency = $this->idempotency;
         $key = $idempotency?->keyFor($message);
 
-        if ($idempotency !== null && $key !== null && ! $idempotency->store->claim($key, $idempotency->leaseSeconds)) {
-            return $this->onClaimLost($idempotency, $key);
+        $token = null;
+
+        if ($idempotency !== null && $key !== null) {
+            $store = $idempotency->store;
+
+            if ($store instanceof OwnershipAwareIdempotencyStore) {
+                $token = $store->claimOwned($key, $idempotency->leaseSeconds);
+                $claimed = $token !== null;
+            } else {
+                $claimed = $store->claim($key, $idempotency->leaseSeconds);
+            }
+
+            if (! $claimed) {
+                return $this->onClaimLost($idempotency, $key);
+            }
         }
 
         try {
             $handler->handle($message);
         } catch (Throwable $e) {
             // Release the in-flight claim so the redelivery can re-run; leaving
-            // it set would suppress a legitimate retry.
+            // it set would suppress a legitimate retry. With an owner token only
+            // our own claim is released: a handler that outlived its lease must not
+            // delete the claim (or the completed record) of the worker that took over.
             if ($idempotency !== null && $key !== null) {
-                $idempotency->store->forget($key);
+                $store = $idempotency->store;
+
+                if ($token !== null && $store instanceof OwnershipAwareIdempotencyStore) {
+                    $store->forgetOwned($key, $token);
+                } else {
+                    $store->forget($key);
+                }
             }
 
             return Outcome::retry($e, 'failed');

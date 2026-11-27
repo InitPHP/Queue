@@ -19,6 +19,7 @@ $transport = new RedisTransport(
     processingSuffix: ':processing',
     failedSuffix:     ':failed',
     delayedSuffix:    ':delayed',
+    startedSuffix:    ':started',
 );
 ```
 
@@ -32,6 +33,7 @@ For a queue named `orders`:
 | `orders:processing` | list | In-flight messages reserved by a worker. |
 | `orders:delayed` | sorted set | Messages waiting out a back-off delay, scored by their due Unix time. |
 | `orders:failed` | list | Dead-lettered messages. |
+| `orders:started` | sorted set | The SHA-1 of every body a worker has taken and not yet finished, scored by the Unix time it was taken. Used to count a delivery whose handler died (see below). |
 
 ## How it works
 
@@ -47,7 +49,31 @@ observe a stop signal instead of blocking forever on an empty queue.
 
 ### Ack
 
-`ack()` removes the in-flight copy with `LREM orders:processing 1 <envelope>`.
+`ack()` removes the in-flight copy with `LREM orders:processing 1 <envelope>` and
+its `orders:started` entry.
+
+### Counting a delivery that never finished
+
+A handler that kills its process (out of memory, `exit`, `SIGKILL`) never reports a
+failure, and the receipt is the message body itself, so the body cannot say that it
+was started. `reserve()` therefore does `ZADD orders:started <now> <sha1(body)>`;
+`ack()`, `release()` and `deadLetter()` remove that member. When `ZADD` finds the
+member already there, the same body was started before and never finished (your
+reaper moved it back from `orders:processing`): that delivery is counted by one
+script that replaces the processing entry with the body whose `attempts` is raised by
+one, and the worker dead-letters the message once the count reaches `maxAttempts`
+(see [Retries & Dead-Letters](Retries-and-Dead-Letters.md#a-handler-that-kills-its-process)).
+The count lives in the body, so it survives the next crash and your reaper, which
+only has to move `orders:processing` entries back unchanged. The body format is not
+touched; a worker on an older version takes no part and its finished messages leave a
+member that is pruned after a week.
+
+Two limits follow. Two messages with the same body count as one; a producer from this
+library mints a unique `meta.id` for every message, so only a producer that does not
+can hit this. And a worker that dies between `BLMOVE` and the `ZADD` leaves no member,
+so that one delivery is not counted. A client without `zadd`/`zrem` (see
+[phpredis](#using-phpredis-instead)) is not an error: the counting is switched off and
+`reserve()` behaves as before.
 
 ### Retry with delay
 
@@ -93,7 +119,8 @@ the reaper is faster than the handler. Two things are worth knowing when you wri
 the reaper:
 
 - **Keep its delay above your slowest handler.** Moving a message back while its
-  handler is still running makes a second worker run it concurrently.
+  handler is still running makes a second worker run it concurrently, and counts
+  that delivery as an attempt.
 - **If it rewrites the envelope** (to add `attempts`, say), the late worker's retry
   can no longer find the copy by its old body and is ignored; the reaper's own
   increment is then the only count. Moving the body back unchanged lets both
@@ -130,7 +157,9 @@ The consume side is written against `Predis\ClientInterface`. If you use the
 
 - install `predis/predis` (pure PHP, no extension needed — the supported path), or
 - wrap phpredis in a thin adapter exposing the same `blmove` / `rpush` / `lrem` /
-  `zadd` / `zrangebyscore` / `zrem` methods. `eval` is optional: leave it out (let
+  `zadd` / `zrangebyscore` / `zrem` methods (plus `zremrangebyscore` and `linsert`
+  for the [delivery count](#counting-a-delivery-that-never-finished); without them the
+  count is switched off). `eval` is optional: leave it out (let
   the call throw `BadMethodCallException`) and the transport uses the
   [command-by-command path](#two-paths-two-guarantees). If the adapter does provide
   `eval`, it must accept Predis's argument order, `eval($script, $numKeys, ...$keysAndArgs)`

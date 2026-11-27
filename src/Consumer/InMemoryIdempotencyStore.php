@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace InitPHP\Queue\Consumer;
 
 use InitPHP\Queue\Contracts\CompletionAwareIdempotencyStore;
+use InitPHP\Queue\Contracts\OwnershipAwareIdempotencyStore;
 
 /**
  * The bundled reference {@see \InitPHP\Queue\Contracts\IdempotencyStore}: an in-process array of seen
@@ -20,14 +21,15 @@ use InitPHP\Queue\Contracts\CompletionAwareIdempotencyStore;
  * Expiry uses {@see hrtime()} (a monotonic clock) so it is immune to wall-clock
  * jumps; a null expiry means "remembered forever".
  */
-final class InMemoryIdempotencyStore implements CompletionAwareIdempotencyStore
+final class InMemoryIdempotencyStore implements CompletionAwareIdempotencyStore, OwnershipAwareIdempotencyStore
 {
     /**
      * key => entry. `expiry` is nanoseconds on the monotonic clock, or null for
      * never; `completed` is true once the key was recorded with remember() and
-     * false while it is only an in-flight claim.
+     * false while it is only an in-flight claim; `token` identifies the claim
+     * (claimOwned()) and is null for a completed record or a plain claim().
      *
-     * @var array<string, array{expiry: int|null, completed: bool}>
+     * @var array<string, array{expiry: int|null, completed: bool, token: string|null}>
      */
     private array $entries = [];
 
@@ -51,18 +53,23 @@ final class InMemoryIdempotencyStore implements CompletionAwareIdempotencyStore
 
     public function claim(string $key, int $leaseSeconds = 0): bool
     {
-        if ($this->seen($key)) {
-            return false;
+        return $this->take($key, $leaseSeconds, null);
+    }
+
+    public function claimOwned(string $key, int $leaseSeconds = 0): ?string
+    {
+        $token = bin2hex(random_bytes(16));
+
+        return $this->take($key, $leaseSeconds, $token) ? $token : null;
+    }
+
+    public function forgetOwned(string $key, string $token): void
+    {
+        // A lapsed claim another worker took, or a completed record, carries a
+        // different (or no) token and stays.
+        if (($this->entries[$key]['token'] ?? null) === $token) {
+            unset($this->entries[$key]);
         }
-
-        // Hold the claim under a short lease so a crash mid-handler frees it for
-        // the redelivery, rather than blocking the key forever.
-        $this->entries[$key] = [
-            'expiry' => $this->expiryFor($leaseSeconds > 0 ? $leaseSeconds : null),
-            'completed' => false,
-        ];
-
-        return true;
     }
 
     public function isCompleted(string $key): bool
@@ -72,12 +79,29 @@ final class InMemoryIdempotencyStore implements CompletionAwareIdempotencyStore
 
     public function remember(string $key, ?int $ttl = null): void
     {
-        $this->entries[$key] = ['expiry' => $this->expiryFor($ttl), 'completed' => true];
+        $this->entries[$key] = ['expiry' => $this->expiryFor($ttl), 'completed' => true, 'token' => null];
     }
 
     public function forget(string $key): void
     {
         unset($this->entries[$key]);
+    }
+
+    private function take(string $key, int $leaseSeconds, ?string $token): bool
+    {
+        if ($this->seen($key)) {
+            return false;
+        }
+
+        // Hold the claim under a short lease so a crash mid-handler frees it for
+        // the redelivery, rather than blocking the key forever.
+        $this->entries[$key] = [
+            'expiry' => $this->expiryFor($leaseSeconds > 0 ? $leaseSeconds : null),
+            'completed' => false,
+            'token' => $token,
+        ];
+
+        return true;
     }
 
     /**
