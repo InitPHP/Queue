@@ -69,6 +69,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   handler that outlives `retryAfter` (PDO) or your Redis reaper's delay while its
   worker is alive looks like a dead one and its second delivery is counted.
 
+### Changed
+
+- CI now also runs the test suite on PHP 8.6 (8.2, 8.3, 8.4, 8.5 and 8.6).
+
 ## [2.3.0] - 2026-11-25
 
 ### Added

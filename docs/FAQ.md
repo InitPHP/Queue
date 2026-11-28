@@ -82,4 +82,4 @@ reset `attempts`, and re-publish. See
 
 ### What PHP versions are supported?
 
-PHP **8.2, 8.3, 8.4 and 8.5** are tested in CI.
+PHP **8.2, 8.3, 8.4, 8.5 and 8.6** are tested in CI.
