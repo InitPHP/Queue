@@ -22,6 +22,7 @@ use Mockery;
 use Mockery\Adapter\Phpunit\MockeryPHPUnitIntegration;
 use PDO;
 use PHPUnit\Framework\TestCase;
+use Predis\Response\ServerException;
 
 /**
  * A handler that kills its process (OOM, `exit`, SIGKILL) never reports a failure.
@@ -382,6 +383,130 @@ final class AbandonedDeliveryTest extends TestCase
         $worker->runOnce('orders');
 
         self::assertCount(1, $handler->handled);
+    }
+
+    public function test_an_exhausted_message_whose_key_was_recorded_is_dropped_not_failed(): void
+    {
+        // The handler succeeded and remembered the key, then the worker died before the ack.
+        $pdo = $this->pdo();
+        $inner = new PdoTransport($pdo, 'jobs', null, 'default', 0);
+        $inner->createSchema();
+        $inner->publish($this->payload(), 'orders');
+
+        $store = new InMemoryIdempotencyStore();
+        $transport = new OutcomeDroppingTransport($inner);
+        $handler = new RecordingHandler();
+        $events = [];
+        $worker = new Worker(
+            $transport,
+            new Dispatcher((new HandlerMap())->register(self::URN, $handler), idempotency: new IdempotencyOptions($store)),
+            new WorkerOptions(maxAttempts: 1, sleepWhenEmpty: 0.0),
+            static function (string $level, string $event, array $context) use (&$events): void {
+                $events[] = $event . ':' . ($context['reason'] ?? '');
+            },
+        );
+
+        $worker->runOnce('orders'); // handler runs, key recorded, ack lost
+        self::assertCount(1, $handler->handled);
+        self::assertTrue($store->isCompleted('bq:idemp:msg-1'));
+
+        $transport->dropOutcomes = false;
+        $worker->runOnce('orders'); // taken over: attempts 1 >= maxAttempts 1
+
+        self::assertCount(1, $handler->handled, 'the handler is not run again');
+        self::assertSame(0, $this->rows($pdo, 'jobs'), 'the row is acked');
+        self::assertSame(0, $this->rows($pdo, 'jobs_failed'), 'a message that was handled is not failed');
+        self::assertContains('job.dropped:duplicate', $events);
+    }
+
+    public function test_an_exhausted_message_whose_key_is_still_claimed_waits_instead_of_failing(): void
+    {
+        $pdo = $this->pdo();
+        $transport = new PdoTransport($pdo, 'jobs', null, 'default', 0);
+        $transport->createSchema();
+        $transport->publish($this->payload(), 'orders');
+        $transport->reserve('orders'); // the first delivery is still running (or lost)
+
+        $store = new InMemoryIdempotencyStore();
+        $store->claim('bq:idemp:msg-1', 300); // its claim has not lapsed
+        $handler = new RecordingHandler();
+        $worker = new Worker(
+            $transport,
+            new Dispatcher((new HandlerMap())->register(self::URN, $handler), idempotency: new IdempotencyOptions($store)),
+            new WorkerOptions(maxAttempts: 1, sleepWhenEmpty: 0.0),
+        );
+
+        $worker->runOnce('orders'); // taken over: attempts 1 >= maxAttempts 1
+
+        self::assertSame([], $handler->handled);
+        self::assertSame(1, $this->rows($pdo, 'jobs'), 'the message is put back, not lost');
+        self::assertSame(0, $this->rows($pdo, 'jobs_failed'), 'and not dead-lettered while its key is held');
+    }
+
+    public function test_an_exhausted_message_with_no_idempotency_record_is_still_dead_lettered(): void
+    {
+        $pdo = $this->pdo();
+        $transport = new PdoTransport($pdo, 'jobs', null, 'default', 0);
+        $transport->createSchema();
+        $transport->publish($this->payload(), 'orders');
+        $transport->reserve('orders'); // lost
+
+        $handler = new RecordingHandler();
+        $worker = new Worker(
+            $transport,
+            new Dispatcher(
+                (new HandlerMap())->register(self::URN, $handler),
+                idempotency: new IdempotencyOptions(new InMemoryIdempotencyStore()),
+            ),
+            new WorkerOptions(maxAttempts: 1, sleepWhenEmpty: 0.0),
+        );
+
+        $worker->runOnce('orders');
+
+        self::assertSame([], $handler->handled);
+        self::assertSame(0, $this->rows($pdo, 'jobs'));
+        self::assertSame(1, $this->rows($pdo, 'jobs_failed'));
+    }
+
+    public function test_redis_a_user_without_permission_for_the_counting_commands_keeps_consuming(): void
+    {
+        // A 2.3 ACL: blmove, rpush, lrem, zadd, zrangebyscore, zrem; no EVAL, no ZREMRANGEBYSCORE.
+        $client = Mockery::mock(\Predis\ClientInterface::class);
+        $client->shouldReceive('eval')->once()->andThrow(new ServerException("NOPERM this user has no permissions to run the 'eval' command"));
+        $client->shouldReceive('zrangebyscore')->andReturn([]);
+        $client->shouldReceive('blmove')->andReturn($this->payload());
+        $client->shouldReceive('zremrangebyscore')->once()->andThrow(new ServerException("NOPERM this user has no permissions to run the 'zremrangebyscore' command"));
+        $client->shouldReceive('zadd')->never();
+
+        $message = (new RedisTransport($client, 'default'))->reserve('orders', 1.0);
+
+        self::assertNotNull($message, 'the message is not stranded on the processing list');
+        self::assertFalse($message->wasAbandoned());
+        self::assertSame(0, $message->attempts());
+    }
+
+    public function test_redis_a_refused_swap_hands_the_message_out_uncounted_instead_of_failing(): void
+    {
+        $client = Mockery::mock(\Predis\ClientInterface::class);
+        $client->shouldReceive('eval')->once()->andThrow(new ServerException("NOPERM this user has no permissions to run the 'eval' command"));
+        $client->shouldReceive('zrangebyscore')->andReturn([]);
+        $client->shouldReceive('blmove')->andReturn($this->payload());
+        $client->shouldReceive('zremrangebyscore')->andReturn(0);
+        $client->shouldReceive('zadd')->once()->andReturn(0); // the body was started before: it must be counted
+        $client->shouldReceive('linsert')->once()->andThrow(new ServerException("NOPERM this user has no permissions to run the 'linsert' command"));
+
+        $transport = new RedisTransport($client, 'default');
+        $message = $transport->reserve('orders', 1.0);
+
+        self::assertNotNull($message, 'the message is not left on the processing list for good');
+        self::assertFalse($message->wasAbandoned());
+        self::assertSame(0, $message->attempts());
+
+        // The counting is off from now on: no further sorted-set commands are tried.
+        $client->shouldReceive('zrem')->never();
+        $client->shouldReceive('lrem')->once()->andReturn(1);
+        self::assertNotNull($transport->reserve('orders', 1.0));
+        $transport->ack($message);
     }
 
     /** What a user's reaper does: put every processing entry back on the queue. */

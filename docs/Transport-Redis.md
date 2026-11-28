@@ -71,9 +71,14 @@ member that is pruned after a week.
 Two limits follow. Two messages with the same body count as one; a producer from this
 library mints a unique `meta.id` for every message, so only a producer that does not
 can hit this. And a worker that dies between `BLMOVE` and the `ZADD` leaves no member,
-so that one delivery is not counted. A client without `zadd`/`zrem` (see
-[phpredis](#using-phpredis-instead)) is not an error: the counting is switched off and
-`reserve()` behaves as before.
+so that one delivery is not counted. A client without the commands this uses
+(`zadd`, `zrem`, `zremrangebyscore`, `linsert`; see
+[phpredis](#using-phpredis-instead)), or a Redis user the ACL refuses them (`NOPERM`),
+is not an error: the counting is switched off the first time a command is refused
+and `reserve()` hands the message out as it did in 2.3. Counting never fails a
+reservation, because the message is already on `orders:processing` by then. If your
+ACL is the 2.3 list (`+blmove +rpush +lrem +zadd +zrangebyscore +zrem`), add
+`+zremrangebyscore +linsert` (and `+eval` for the scripts) to get the counting.
 
 ### Retry with delay
 

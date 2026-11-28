@@ -41,6 +41,14 @@ brings `attempts` to `maxAttempts`, the worker dead-letters the message with rea
 | Redis | the body is back on the queue while its `<queue>:started` entry is still there | every one, in the body and in the processing entry |
 | RabbitMQ | the broker's `redelivered` flag | **one**: classic queues keep no delivery count and the unacked body cannot be rewritten, so a handler that kills its process on every delivery is counted once, not once per crash |
 
+With [deduplication](Idempotent-Consumption.md) on, the idempotency record is read
+before the message is dead-lettered, so a message is not failed for a handler that
+did finish. If the key is recorded as processed (the handler finished and only its
+ack was lost) the message is acknowledged and discarded as a `duplicate`; if the key
+is still claimed (another handler is running, or its lease has not lapsed) the
+message is put back as `in_flight`; only a message with neither is dead-lettered.
+A store that cannot tell a recorded key from a claimed one discards in both cases.
+
 A message put back without an outcome of its own, such as one waiting for another
 handler's [in-flight key](Idempotent-Consumption.md), has its reservation cleared by
 `release()` and is not counted, however many times it waits. A normal failure is not

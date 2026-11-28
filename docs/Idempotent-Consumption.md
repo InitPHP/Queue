@@ -112,7 +112,9 @@ were not run as separate scenarios.
    reports a failure. When the transport hands such a message out again, it counts
    that unfinished delivery as one attempt, and the worker dead-letters the message
    (reason `failed`) once the count reaches `maxAttempts`, without running the
-   handler again. This does not touch waiting: a message put back for an in-flight
+   handler again, after checking the store: a key recorded as processed drops the
+   message as a duplicate, and a key still claimed releases it as `in_flight`. This
+   does not touch waiting: a message put back for an in-flight
    key is released, not abandoned, and is never counted. PDO and Redis count every
    unfinished delivery, RabbitMQ counts one (it keeps no delivery count on a classic
    queue); see [Retries & Dead-Letters](Retries-and-Dead-Letters.md#a-handler-that-kills-its-process).
@@ -196,6 +198,11 @@ constructor argument.
   its started entry). A 2.3 worker reading a row or message that a 2.4 worker
   counted sees an ordinary `attempts` and the usual body. Deploying all workers gives
   the full behaviour; none has to be drained.
+- **A late 2.3 worker can lose a back-off.** While 2.3 and 2.4 workers run side by
+  side, a 2.3 worker whose PDO reservation was taken over by a 2.4 worker still uses
+  the old rule and skips recording its back-off when the stored `attempts` already
+  equals its own. The count is right; only that one delay is lost, and only until
+  the last 2.3 worker has stopped.
 - **`retryAfter` and your Redis reaper now matter for `attempts`.** A handler that
   runs longer than `retryAfter` (PDO) or than your reaper's delay (Redis) while its
   worker is alive is indistinguishable from one that died, so the second delivery is

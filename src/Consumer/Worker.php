@@ -9,7 +9,6 @@ use BabelQueue\DeadLetter\DeadLetter;
 use InitPHP\Queue\Contracts\ConsumerTransport;
 use InitPHP\Queue\Message\ReceivedMessage;
 use JsonException;
-use RuntimeException;
 use Throwable;
 
 /**
@@ -163,20 +162,12 @@ final class Worker
     {
         // A message whose earlier delivery ended without an outcome has already had
         // that delivery counted in `attempts` by the transport. A handler that
-        // kills its process (OOM, `exit`, SIGKILL) never reports a failure, so this
-        // is where such a message reaches `maxAttempts` and is quarantined instead
-        // of being run again for ever.
-        if ($message->wasAbandoned() && $message->attempts() >= $this->options->maxAttempts) {
-            $outcome = Outcome::deadLetter('failed', new RuntimeException(sprintf(
-                'The handler never finished %d time(s): its worker died or its reservation lapsed.',
-                $message->attempts(),
-            )));
-            $this->moveToDeadLetter($message, $outcome, $message->attempts());
-
-            return true;
-        }
-
-        $outcome = $this->dispatcher->dispatch($message);
+        // kills its process (OOM, `exit`, SIGKILL) never reports a failure, so when
+        // that count reaches `maxAttempts` the dispatcher quarantines the message
+        // instead of running it again for ever (after checking the idempotency
+        // store: a message another handler finished, or still holds, is not failed).
+        $exhausted = $message->wasAbandoned() && $message->attempts() >= $this->options->maxAttempts;
+        $outcome = $this->dispatcher->dispatch($message, $exhausted);
 
         switch ($outcome->kind) {
             case OutcomeKind::Ack:

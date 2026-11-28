@@ -13,6 +13,7 @@ use InitPHP\Queue\Contracts\HandlerResolver;
 use InitPHP\Queue\Contracts\OwnershipAwareIdempotencyStore;
 use InitPHP\Queue\Exceptions\ConfigurationException;
 use InitPHP\Queue\Message\ReceivedMessage;
+use RuntimeException;
 use Throwable;
 
 /**
@@ -33,7 +34,8 @@ use Throwable;
  * (when the store is a {@see CompletionAwareIdempotencyStore}): it is put back
  * on the queue, so the message survives that handler failing or its worker
  * dying. A store that is an {@see OwnershipAwareIdempotencyStore} also releases a
- * failed handler's claim only if the handler still owns it. With no options (the default) the dispatcher behaves exactly as before.
+ * failed handler's claim only if the handler still owns it. With no options (the
+ * default) the dispatcher behaves exactly as before.
  */
 final class Dispatcher
 {
@@ -61,8 +63,15 @@ final class Dispatcher
 
     /**
      * Decide what should happen to `$message`.
+     *
+     * @param  bool  $exhausted  True when the transport counted an unfinished delivery
+     *         of this message (its handler's process died) and that brought `attempts`
+     *         up to the worker's `maxAttempts`: the handler is then not run again. With
+     *         deduplication on, a key recorded as processed still drops the message and
+     *         a key another handler holds still releases it; otherwise it is
+     *         dead-lettered as `failed`.
      */
-    public function dispatch(ReceivedMessage $message): Outcome
+    public function dispatch(ReceivedMessage $message, bool $exhausted = false): Outcome
     {
         $reason = EnvelopeValidator::check($message->envelope());
         if ($reason !== null) {
@@ -76,7 +85,41 @@ final class Dispatcher
             return $this->onUnknownUrn($message);
         }
 
-        return $this->runHandler($handler, $message);
+        return $exhausted ? $this->onExhausted($message) : $this->runHandler($handler, $message);
+    }
+
+    /**
+     * An abandoned message that is out of attempts. Before it is quarantined the
+     * idempotency record decides, without claiming anything: a recorded key means the
+     * handler finished (only its ack was lost), so the message is dropped as a
+     * duplicate; a key that is still claimed means another handler is running or its
+     * lease has not lapsed, so the message waits as it would for any redelivery.
+     */
+    private function onExhausted(ReceivedMessage $message): Outcome
+    {
+        $idempotency = $this->idempotency;
+        $key = $idempotency?->keyFor($message);
+
+        if ($idempotency !== null && $key !== null) {
+            $store = $idempotency->store;
+
+            if ($store instanceof CompletionAwareIdempotencyStore) {
+                if ($store->isCompleted($key)) {
+                    return Outcome::drop('duplicate');
+                }
+                if ($store->seen($key)) {
+                    return Outcome::release('in_flight', $idempotency->inFlightDelaySeconds);
+                }
+            } elseif ($store->seen($key)) {
+                // The store cannot tell recorded from claimed: as for a lost claim, discard.
+                return Outcome::drop('duplicate');
+            }
+        }
+
+        return Outcome::deadLetter('failed', new RuntimeException(sprintf(
+            'The handler never finished %d time(s): its worker died or its reservation lapsed.',
+            $message->attempts(),
+        )));
     }
 
     /**

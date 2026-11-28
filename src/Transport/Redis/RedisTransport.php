@@ -274,8 +274,14 @@ final class RedisTransport implements Transport, ConsumerTransport
             }
 
             return $this->swapProcessingEntry($queue, $raw, $counted, $now) ? [$counted, true] : [$raw, false];
-        } catch (BadMethodCallException|Error) {
-            $this->tracking = false;
+        } catch (Throwable $e) {
+            // The message is already on the processing list: failing here would
+            // strand it there. Counting is best effort, so hand the message out as it
+            // is. A client or Redis user that lacks one of the commands (NOPERM, no
+            // such method) turns the counting off, as 2.3 never needed them.
+            if ($this->isCommandUnavailable($e)) {
+                $this->tracking = false;
+            }
 
             return [$raw, false];
         }
@@ -319,8 +325,11 @@ final class RedisTransport implements Transport, ConsumerTransport
 
         try {
             $this->client->zrem($message->queue() . $this->startedSuffix, sha1((string) $message->receipt()));
-        } catch (BadMethodCallException|Error) {
-            $this->tracking = false;
+        } catch (Throwable $e) {
+            // The message already has its outcome; a leftover entry is only pruned later.
+            if ($this->isCommandUnavailable($e)) {
+                $this->tracking = false;
+            }
         }
     }
 
@@ -342,7 +351,7 @@ final class RedisTransport implements Transport, ConsumerTransport
         try {
             return (int) $this->client->eval($script, count($keys), ...$keys, ...$args);
         } catch (Throwable $e) {
-            if (! $this->isScriptingUnavailable($e)) {
+            if (! $this->isCommandUnavailable($e)) {
                 throw $e;
             }
 
@@ -353,10 +362,11 @@ final class RedisTransport implements Transport, ConsumerTransport
     }
 
     /**
-     * Whether `$e` means "this client cannot EVAL" (no such method, a different
-     * signature, or a server that refuses the command) rather than a real failure.
+     * Whether `$e` means "this client cannot run that command" (no such method, a
+     * different signature, or a server that refuses it: `NOPERM`, unknown command)
+     * rather than a real failure.
      */
-    private function isScriptingUnavailable(Throwable $e): bool
+    private function isCommandUnavailable(Throwable $e): bool
     {
         if ($e instanceof BadMethodCallException || $e instanceof Error) {
             return true;

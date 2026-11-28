@@ -43,6 +43,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a store that implements `OwnershipAwareIdempotencyStore`, the late failure releases
   only its own claim, so the claim or completed record of the worker that took over
   stays.
+- An abandoned message that is out of attempts is checked against the idempotency
+  store before it is dead-lettered: a key recorded as processed drops it as a
+  `duplicate` (the handler finished, only its ack was lost) and a key still claimed
+  releases it as `in_flight`. `Dispatcher::dispatch()` has a new optional second
+  argument, `$exhausted`, for this; the `Worker` passes it.
+- `RedisTransport` counting never fails a reservation: a `NOPERM`/unknown-command
+  refusal of `ZREMRANGEBYSCORE`, `LINSERT` or the other commands it adds switches the
+  counting off, and any other failure while counting hands the message out
+  uncounted, instead of leaving it on `<queue>:processing`.
 - `PdoTransport::release()` for a worker whose reservation was taken over records
   the back-off even when the stored `attempts` already equals the one it reports
   (the take-over counted it); `attempts` still never goes back.
