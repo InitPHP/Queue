@@ -45,9 +45,16 @@ With [deduplication](Idempotent-Consumption.md) on, the idempotency record is re
 before the message is dead-lettered, so a message is not failed for a handler that
 did finish. If the key is recorded as processed (the handler finished and only its
 ack was lost) the message is acknowledged and discarded as a `duplicate`; if the key
-is still claimed (another handler is running, or its lease has not lapsed) the
-message is put back as `in_flight`; only a message with neither is dead-lettered.
-A store that cannot tell a recorded key from a claimed one discards in both cases.
+is still claimed (another handler is running, or a dead one's lease has not lapsed)
+the message is put back as `in_flight`; only a message with neither is dead-lettered.
+A message that is put back this way returns out of attempts: the worker treats any
+message that arrives with `attempts` at or above `maxAttempts` and no `dead_letter`
+block as exhausted, whether or not the transport still marks it as unfinished, so
+the crash loop ends as soon as the dead handler's claim has lapsed, even when
+`leaseSeconds` is longer than `retryAfter`. A store that cannot tell a recorded key
+from a claimed one cannot say whether the handler finished, so the message is
+dead-lettered, never discarded. A [replayed](#replaying-a-dead-lettered-message)
+message that still has its `dead_letter` block runs normally.
 
 A message put back without an outcome of its own, such as one waiting for another
 handler's [in-flight key](Idempotent-Consumption.md), has its reservation cleared by

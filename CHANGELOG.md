@@ -47,7 +47,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   store before it is dead-lettered: a key recorded as processed drops it as a
   `duplicate` (the handler finished, only its ack was lost) and a key still claimed
   releases it as `in_flight`. `Dispatcher::dispatch()` has a new optional second
-  argument, `$exhausted`, for this; the `Worker` passes it.
+  argument, `$exhausted`, for this; the `Worker` passes it. A message that is put
+  back this way is treated as exhausted when it returns: any message that arrives
+  with `attempts` at or above `maxAttempts` and no `dead_letter` block is, so a
+  handler that kills its process every time reaches the dead-letter queue even when
+  `leaseSeconds` is longer than the transport's redelivery time. A store that cannot
+  tell a recorded key from a claimed one now dead-letters such a message instead of
+  discarding it.
 - `RedisTransport` counting never fails a reservation: a `NOPERM`/unknown-command
   refusal of `ZREMRANGEBYSCORE`, `LINSERT` or the other commands it adds switches the
   counting off, and any other failure while counting hands the message out

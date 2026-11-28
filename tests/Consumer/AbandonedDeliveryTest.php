@@ -8,11 +8,14 @@ use BabelQueue\Codec\EnvelopeCodec;
 use InitPHP\Queue\Consumer\Dispatcher;
 use InitPHP\Queue\Consumer\IdempotencyOptions;
 use InitPHP\Queue\Consumer\InMemoryIdempotencyStore;
+use InitPHP\Queue\Consumer\OutcomeKind;
 use InitPHP\Queue\Consumer\Worker;
 use InitPHP\Queue\Consumer\WorkerOptions;
 use InitPHP\Queue\Contracts\ConsumerTransport;
 use InitPHP\Queue\Message\ReceivedMessage;
 use InitPHP\Queue\Routing\HandlerMap;
+use InitPHP\Queue\Tests\Support\ClaimOnlyIdempotencyStore;
+use InitPHP\Queue\Tests\Support\CrashableIdempotencyStore;
 use InitPHP\Queue\Tests\Support\InMemoryRedis;
 use InitPHP\Queue\Tests\Support\OutcomeDroppingTransport;
 use InitPHP\Queue\Tests\Support\RecordingHandler;
@@ -348,10 +351,32 @@ final class AbandonedDeliveryTest extends TestCase
         self::assertSame([], $handler->handled);
     }
 
-    public function test_a_message_that_was_not_abandoned_runs_even_with_a_high_attempt_count(): void
+    public function test_a_message_out_of_attempts_is_quarantined_even_when_it_returns_no_longer_marked_abandoned(): void
     {
-        // e.g. a dead-letter message put back by hand with `attempts` preserved.
+        // It was put back (for example waiting on an in-flight key) after the count reached
+        // maxAttempts; the transport no longer knows it was abandoned, the count still says so.
         $message = new ReceivedMessage('orders', $this->payload(3), EnvelopeCodec::decode($this->payload(3)), 'r');
+        $transport = Mockery::mock(ConsumerTransport::class);
+        $transport->shouldReceive('reserve')->once()->andReturn($message);
+        $transport->shouldReceive('deadLetter')->once()->with($message, Mockery::type('string'));
+        $handler = new RecordingHandler();
+        $worker = new Worker(
+            $transport,
+            new Dispatcher((new HandlerMap())->register(self::URN, $handler)),
+            new WorkerOptions(maxAttempts: 3, sleepWhenEmpty: 0.0),
+        );
+
+        $worker->runOnce('orders');
+
+        self::assertSame([], $handler->handled);
+    }
+
+    public function test_a_replayed_dead_letter_with_its_block_still_runs_once_more(): void
+    {
+        $envelope = EnvelopeCodec::decode($this->payload(3));
+        $envelope['dead_letter'] = ['reason' => 'failed'];
+        $body = EnvelopeCodec::encode($envelope);
+        $message = new ReceivedMessage('orders', $body, $envelope, 'r');
         $transport = Mockery::mock(ConsumerTransport::class);
         $transport->shouldReceive('reserve')->once()->andReturn($message);
         $transport->shouldReceive('ack')->once()->with($message);
@@ -441,6 +466,64 @@ final class AbandonedDeliveryTest extends TestCase
         self::assertSame([], $handler->handled);
         self::assertSame(1, $this->rows($pdo, 'jobs'), 'the message is put back, not lost');
         self::assertSame(0, $this->rows($pdo, 'jobs_failed'), 'and not dead-lettered while its key is held');
+    }
+
+    public function test_pdo_a_handler_that_dies_every_time_ends_in_the_dead_letter_table_even_with_a_lease_longer_than_retry_after(): void
+    {
+        // The defaults that matter: the dead worker's claim (lease 300 s) outlives the
+        // transport's redelivery time, so every redelivery first finds the claim held.
+        $pdo = $this->pdo();
+        $inner = new PdoTransport($pdo, 'jobs', null, 'default', 0);
+        $inner->createSchema();
+        $inner->publish($this->payload(), 'orders');
+
+        $store = new CrashableIdempotencyStore();
+        $transport = new OutcomeDroppingTransport($inner);
+        $handled = 0;
+        $handlers = (new HandlerMap())->register(self::URN, static function () use (&$handled, $store, $transport): void {
+            ++$handled;
+            $store->dead = true; // the process dies inside the handler:
+            $transport->dropOutcomes = true; // no remember(), no forget(), no ack
+        });
+        $worker = new Worker(
+            $transport,
+            new Dispatcher($handlers, idempotency: new IdempotencyOptions($store, leaseSeconds: 300, inFlightDelaySeconds: 5)),
+            new WorkerOptions(maxAttempts: 3, sleepWhenEmpty: 0.0),
+        );
+
+        for ($turn = 0; $turn < 30 && $this->rows($pdo, 'jobs') > 0; ++$turn) {
+            $before = $handled;
+            $pdo->exec("UPDATE jobs SET available_at = '2000-01-01 00:00:00'"); // any wait has passed
+            $worker->runOnce('orders');
+            $store->dead = false;
+            $transport->dropOutcomes = false;
+
+            if ($handled === $before) {
+                $store->lapse('bq:idemp:msg-1'); // the delivery only waited: time passes until the lease runs out
+            }
+        }
+
+        self::assertSame(3, $handled, 'the handler ran once per attempt and no more');
+        self::assertSame(0, $this->rows($pdo, 'jobs'), 'the crash loop ended');
+        $failed = $pdo->query('SELECT attempts, reason FROM jobs_failed')->fetchAll(PDO::FETCH_ASSOC);
+        self::assertCount(1, $failed);
+        self::assertSame(3, (int) $failed[0]['attempts']);
+        self::assertSame('failed', $failed[0]['reason']);
+    }
+
+    public function test_an_exhausted_message_on_a_store_that_cannot_tell_claimed_from_recorded_is_quarantined_not_discarded(): void
+    {
+        $store = new ClaimOnlyIdempotencyStore();
+        $store->claim('bq:idemp:msg-1', 300);
+        $dispatcher = new Dispatcher(
+            (new HandlerMap())->register(self::URN, new RecordingHandler()),
+            idempotency: new IdempotencyOptions($store),
+        );
+        $envelope = EnvelopeCodec::decode($this->payload(3));
+
+        $outcome = $dispatcher->dispatch(new ReceivedMessage('orders', $this->payload(3), $envelope, 1), true);
+
+        self::assertSame(OutcomeKind::DeadLetter, $outcome->kind);
     }
 
     public function test_an_exhausted_message_with_no_idempotency_record_is_still_dead_lettered(): void

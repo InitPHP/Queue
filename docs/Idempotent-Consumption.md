@@ -113,7 +113,8 @@ were not run as separate scenarios.
    that unfinished delivery as one attempt, and the worker dead-letters the message
    (reason `failed`) once the count reaches `maxAttempts`, without running the
    handler again, after checking the store: a key recorded as processed drops the
-   message as a duplicate, and a key still claimed releases it as `in_flight`. This
+   message as a duplicate, and a key still claimed releases it as `in_flight` (it
+   stays out of attempts and is dead-lettered once the claim has lapsed). This
    does not touch waiting: a message put back for an in-flight
    key is released, not abandoned, and is never counted. PDO and Redis count every
    unfinished delivery, RabbitMQ counts one (it keeps no delivery count on a classic

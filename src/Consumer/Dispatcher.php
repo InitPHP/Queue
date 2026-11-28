@@ -64,8 +64,8 @@ final class Dispatcher
     /**
      * Decide what should happen to `$message`.
      *
-     * @param  bool  $exhausted  True when the transport counted an unfinished delivery
-     *         of this message (its handler's process died) and that brought `attempts`
+     * @param  bool  $exhausted  True when unfinished deliveries of this message (its
+     *         handler's process died, as counted by the transport) brought `attempts`
      *         up to the worker's `maxAttempts`: the handler is then not run again. With
      *         deduplication on, a key recorded as processed still drops the message and
      *         a key another handler holds still releases it; otherwise it is
@@ -89,11 +89,14 @@ final class Dispatcher
     }
 
     /**
-     * An abandoned message that is out of attempts. Before it is quarantined the
-     * idempotency record decides, without claiming anything: a recorded key means the
-     * handler finished (only its ack was lost), so the message is dropped as a
-     * duplicate; a key that is still claimed means another handler is running or its
-     * lease has not lapsed, so the message waits as it would for any redelivery.
+     * A message that is out of attempts because deliveries of it never finished.
+     * Before it is quarantined the idempotency record decides, without claiming
+     * anything: a recorded key means the handler finished (only its ack was lost), so
+     * the message is dropped as a duplicate; a key that is still claimed means another
+     * handler is running or a dead one's lease has not lapsed, so the message waits.
+     * It comes back still out of attempts, and is quarantined once the claim is gone.
+     * A store that cannot tell a recorded key from a claimed one cannot say whether the
+     * handler finished, so the message is quarantined rather than discarded.
      */
     private function onExhausted(ReceivedMessage $message): Outcome
     {
@@ -110,9 +113,6 @@ final class Dispatcher
                 if ($store->seen($key)) {
                     return Outcome::release('in_flight', $idempotency->inFlightDelaySeconds);
                 }
-            } elseif ($store->seen($key)) {
-                // The store cannot tell recorded from claimed: as for a lost claim, discard.
-                return Outcome::drop('duplicate');
             }
         }
 
