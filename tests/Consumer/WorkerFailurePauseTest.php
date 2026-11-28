@@ -115,6 +115,7 @@ final class WorkerFailurePauseTest extends TestCase
         $delivered = Mockery::mock(AMQPMessage::class);
         $delivered->shouldReceive('getBody')->andReturn($body);
         $delivered->shouldReceive('getDeliveryTag')->andReturn(7);
+        $delivered->shouldReceive('isRedelivered')->andReturn(false);
 
         $channel = Mockery::mock(AMQPChannel::class);
         $channel->shouldReceive('queue_declare');

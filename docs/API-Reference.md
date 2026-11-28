@@ -111,7 +111,8 @@ public function keyFor(InitPHP\Queue\Message\ReceivedMessage $message): ?string
 
 A negative `ttl` or `leaseSeconds`, or an `inFlightDelaySeconds` below 1, throws
 `ConfigurationException`. `InitPHP\Queue\Consumer\InMemoryIdempotencyStore`
-implements `CompletionAwareIdempotencyStore` and adds `count(): int`.
+implements `CompletionAwareIdempotencyStore` and `OwnershipAwareIdempotencyStore` and
+adds `count(): int`.
 
 ### Outcome / OutcomeKind
 
@@ -213,6 +214,23 @@ failed claim on a completed key is dropped, on an in-flight key the message is
 released. A store that implements only `IdempotencyStore` keeps the previous
 behaviour (always dropped). See [Idempotent Consumption](Idempotent-Consumption.md).
 
+### OwnershipAwareIdempotencyStore
+
+```php
+interface OwnershipAwareIdempotencyStore extends IdempotencyStore
+{
+    public function claimOwned(string $key, int $leaseSeconds = 0): ?string;   // token, or null when not won
+    public function forgetOwned(string $key, string $token): void;             // releases only the claim the token owns
+}
+```
+
+Optional and independent of `CompletionAwareIdempotencyStore`. When the store
+implements it, the `Dispatcher` takes the claim with `claimOwned()` and releases a
+failed handler's claim with `forgetOwned()`, so a handler that outlived its lease
+cannot delete the claim or the completed record of the worker that took over. A store
+without it keeps `claim()` and `forget()`. `InMemoryIdempotencyStore` implements it.
+See [Claim ownership](Idempotent-Consumption.md#claim-ownership).
+
 ### ConsumerTransport
 
 ```php
@@ -234,7 +252,7 @@ interface ConsumerTransport
 `InitPHP\Queue\Message\ReceivedMessage implements BabelQueue\Contracts\InboundMessage`.
 
 ```php
-public function __construct(string $queue, string $rawBody, array $envelope, mixed $receipt)
+public function __construct(string $queue, string $rawBody, array $envelope, mixed $receipt, bool $abandoned = false)
 
 // InboundMessage:
 public function getUrn(): string
@@ -248,6 +266,7 @@ public function rawBody(): string
 public function envelope(): array
 public function attempts(): int
 public function receipt(): mixed
+public function wasAbandoned(): bool   // a previous delivery never ended; the transport counted it in attempts()
 ```
 
 ---
@@ -286,6 +305,7 @@ public function __construct(
     string $processingSuffix = ':processing',
     string $failedSuffix = ':failed',
     string $delayedSuffix = ':delayed',
+    string $startedSuffix = ':started',
 )
 ```
 

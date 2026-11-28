@@ -92,7 +92,9 @@ alike, without `SELECT … FOR UPDATE SKIP LOCKED`:
 
 1. `SELECT` the oldest ready row for the queue (`available_at <= now`, not
    currently reserved).
-2. `UPDATE … SET reserved_at = now WHERE id = ? AND (reserved_at IS NULL OR reserved_at <= :stale)`.
+2. `UPDATE … SET reserved_at = now WHERE id = ? AND reserved_at IS NULL`; for a row
+   whose reservation has lapsed, `… AND reserved_at = <the stamp that was read>`
+   instead (see below).
 3. If exactly one row was affected, the claim succeeded; otherwise another worker
    won it, so try the next row.
 
@@ -104,6 +106,18 @@ A row reserved by a worker that then crashes would otherwise be stuck forever. A
 reservation older than `retryAfter` seconds (default 90) is treated as abandoned
 and becomes reservable again, so the message is delivered again (at-least-once)
 instead of staying stuck. Set it comfortably above your slowest handler's runtime.
+
+**A lapsed reservation counts as an attempt.** A row that is still stamped
+`reserved_at` when it is taken over was never acked, released or dead-lettered: its
+worker died (a handler killed by out-of-memory, `exit` or `SIGKILL` reports nothing),
+or its handler outlived `retryAfter`. The take-over raises `attempts` by one, in the
+column and in the envelope in `payload`, in the same `UPDATE` that takes the row, so
+only one of several workers racing for it counts it, and the worker dead-letters the
+message when the count reaches `maxAttempts` (see
+[Retries & Dead-Letters](Retries-and-Dead-Letters.md#a-handler-that-kills-its-process)).
+`release()` clears the stamp, so a message that waits for another handler's
+in-flight key is never counted. Nothing changes in the schema, and a row left by
+version 2.3 is counted the first time a newer worker takes it over.
 
 If you also enable the dispatcher's [deduplication](Idempotent-Consumption.md),
 a redelivery that arrives while another handler's claim is still held (a dead
@@ -127,6 +141,8 @@ not overwrite the new holder's reservation, but its failure still counts.
   `maxAttempts` and `jobs_failed`, as before. The holder's own outcome then
   completes the job; this can take until its handler ends, so such a message is
   dead-lettered later than a worker that cleared the other's reservation would have.
+  The take-over already counted one attempt (above), so when the stored count already
+  equals the one the late worker reports, only the back-off is recorded.
 
 A message put back **unchanged** (waiting for another handler) only reschedules the
 row, only while the reservation is still its own, and never shortens a back-off

@@ -11,8 +11,8 @@ use Predis\Command\CommandInterface;
 /**
  * A tiny in-memory stand-in for a Predis client implementing just the list and
  * sorted-set commands {@see \InitPHP\Queue\Transport\Redis\RedisTransport} uses
- * (`BLMOVE`, `RPUSH`, `LREM`, `ZADD`, `ZRANGEBYSCORE`, `ZREM`) plus an `eval()`
- * that recognises the transport's three scripts by their leading marker comment
+ * (`BLMOVE`, `RPUSH`, `LREM`, `LINSERT`, `ZADD`, `ZRANGEBYSCORE`, `ZREMRANGEBYSCORE`,
+ * `ZREM`) plus an `eval()` that recognises the transport's four scripts by their leading marker comment
  * and applies the same steps atomically (the real scripts run against Redis in
  * the integration test). The remaining
  * {@see ClientInterface} methods are not exercised by the transport and throw.
@@ -113,6 +113,33 @@ final class InMemoryRedis implements ClientInterface
         return array_map(strval(...), array_keys($matching));
     }
 
+    public function zremrangebyscore(string $key, string $min, string $max): int
+    {
+        $removed = 0;
+        foreach ($this->zrangebyscore($key, $min, $max) as $member) {
+            $removed += $this->zrem($key, $member);
+        }
+
+        return $removed;
+    }
+
+    /**
+     * @return int the new list length, or -1 when the pivot is not in the list
+     */
+    public function linsert(string $key, string $whence, string $pivot, string $value): int
+    {
+        $list = $this->lists[$key] ?? [];
+        $at = array_search($pivot, $list, true);
+        if ($at === false) {
+            return -1;
+        }
+
+        array_splice($list, $whence === 'BEFORE' ? $at : $at + 1, 0, [$value]);
+        $this->lists[$key] = $list;
+
+        return count($list);
+    }
+
     public function zrem(string $key, string $member): int
     {
         if (! isset($this->zsets[$key][$member])) {
@@ -143,6 +170,7 @@ final class InMemoryRedis implements ClientInterface
             if (! $this->takeOwnership($keys[0], $keys[2], $keys[1], $argv[0])) {
                 return 0;
             }
+            $this->zrem($keys[3], $argv[3]);
             (float) $argv[2] > 0
                 ? $this->zadd($keys[2], [$argv[1] => (float) $argv[2]])
                 : $this->rpush($keys[1], [$argv[1]]);
@@ -154,7 +182,19 @@ final class InMemoryRedis implements ClientInterface
             if (! $this->takeOwnership($keys[0], $keys[2], $keys[3], $argv[0])) {
                 return 0;
             }
+            $this->zrem($keys[4], $argv[2]);
             $this->rpush($keys[1], [$argv[1]]);
+
+            return 1;
+        }
+
+        if (str_contains($script, '-- queue:count-abandoned')) {
+            if ($this->linsert($keys[0], 'AFTER', $argv[0], $argv[1]) <= 0) {
+                return 0;
+            }
+            $this->lrem($keys[0], 1, $argv[0]);
+            $this->zrem($keys[1], $argv[2]);
+            $this->zadd($keys[1], [$argv[3] => (float) $argv[4]]);
 
             return 1;
         }

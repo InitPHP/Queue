@@ -8,6 +8,7 @@ use BabelQueue\Codec\EnvelopeCodec;
 use BabelQueue\Contracts\Transport;
 use InitPHP\Queue\Contracts\ConsumerTransport;
 use InitPHP\Queue\Exceptions\ConfigurationException;
+use InitPHP\Queue\Message\AbandonedDelivery;
 use InitPHP\Queue\Message\ReceivedMessage;
 use PDO;
 
@@ -22,7 +23,12 @@ use PDO;
  * count confirms the claim — so two workers never run the same job, and it works
  * identically on MySQL and SQLite without `SELECT … FOR UPDATE SKIP LOCKED`. A
  * reservation older than `$retryAfter` seconds is treated as abandoned and
- * becomes reservable again, so a crashed worker never loses a message.
+ * becomes reservable again, so a crashed worker never loses a message. Taking
+ * over such a lapsed reservation counts as one failed attempt: `attempts` (and the
+ * envelope in `payload`) are raised by one in the same `UPDATE`, so a handler that
+ * kills its process every time still reaches `maxAttempts` and the dead-letter
+ * table. A message put back with `release()` has its reservation cleared and is
+ * not counted, so waiting for another handler's in-flight key costs no attempt.
  *
  * `release()` is conditional on the reservation this transport instance took. A
  * worker whose reservation lapsed and was taken over cannot overwrite the new
@@ -99,12 +105,9 @@ final class PdoTransport implements Transport, ConsumerTransport
         $stale = $this->at(-$this->retryAfter);
 
         $select = $this->pdo->prepare(
-            "SELECT id, payload FROM {$this->table}"
+            "SELECT id, payload, reserved_at FROM {$this->table}"
             . ' WHERE queue = :queue AND available_at <= :now AND (reserved_at IS NULL OR reserved_at <= :stale)'
             . ' ORDER BY id ASC LIMIT 1',
-        );
-        $claim = $this->pdo->prepare(
-            "UPDATE {$this->table} SET reserved_at = :reserved WHERE id = :id AND (reserved_at IS NULL OR reserved_at <= :stale)",
         );
 
         // Re-select on a lost claim: another worker took this row, so try the next.
@@ -115,16 +118,65 @@ final class PdoTransport implements Transport, ConsumerTransport
                 return null;
             }
 
-            $claim->execute([':reserved' => $now, ':id' => $row['id'], ':stale' => $stale]);
-            if ($claim->rowCount() === 1) {
-                $this->reservations[(int) $row['id']] = $now;
-                $payload = (string) $row['payload'];
+            $id = (int) $row['id'];
+            $payload = (string) $row['payload'];
+            $previous = $row['reserved_at'] === null ? null : (string) $row['reserved_at'];
 
-                return new ReceivedMessage($queue, $payload, EnvelopeCodec::decode($payload), (int) $row['id']);
+            if ($previous === null) {
+                $abandoned = false;
+                $claimed = $this->claimFree($id, $now);
+            } else {
+                // The row is still stamped as reserved but the reservation lapsed: the
+                // worker that held it never acked, released or dead-lettered it (it
+                // died, or its handler outlived `retryAfter`). That delivery counts as
+                // an attempt, recorded in the same UPDATE that takes the row so two
+                // workers cannot both count it. A message put back with release()
+                // clears the stamp, so waiting on an in-flight key never lands here.
+                $counted = AbandonedDelivery::countedBody($payload);
+                $abandoned = $counted !== null;
+                $claimed = $this->claimLapsed($id, $now, $previous, $counted);
+                $payload = $counted ?? $payload;
+            }
+
+            if ($claimed) {
+                $this->reservations[$id] = $now;
+
+                return new ReceivedMessage($queue, $payload, EnvelopeCodec::decode($payload), $id, $abandoned);
             }
         }
 
         return null;
+    }
+
+    private function claimFree(int $id, string $now): bool
+    {
+        $claim = $this->pdo->prepare(
+            "UPDATE {$this->table} SET reserved_at = :reserved WHERE id = :id AND reserved_at IS NULL",
+        );
+        $claim->execute([':reserved' => $now, ':id' => $id]);
+
+        return $claim->rowCount() === 1;
+    }
+
+    /**
+     * Take a row whose reservation lapsed. The `WHERE` matches the exact stamp that
+     * was read, so only one of several workers racing for the row succeeds.
+     */
+    private function claimLapsed(int $id, string $now, string $previous, ?string $payload): bool
+    {
+        $assign = $payload !== null ? ', attempts = :attempts, payload = :payload' : '';
+        $params = [':reserved' => $now, ':id' => $id, ':previous' => $previous];
+        if ($payload !== null) {
+            $params[':attempts'] = $this->attemptsOf(EnvelopeCodec::decode($payload));
+            $params[':payload'] = $payload;
+        }
+
+        $claim = $this->pdo->prepare(
+            "UPDATE {$this->table} SET reserved_at = :reserved{$assign} WHERE id = :id AND reserved_at = :previous",
+        );
+        $claim->execute($params);
+
+        return $claim->rowCount() === 1;
     }
 
     public function ack(ReceivedMessage $message): void
@@ -190,14 +242,21 @@ final class PdoTransport implements Transport, ConsumerTransport
         // over). The failure still counts: record the attempt and its back-off
         // without touching the holder's reservation, so a handler that always runs
         // longer than `retryAfter` still reaches `maxAttempts` and the dead-letter
-        // table, as it did before. A delay is only ever extended, never shortened.
+        // table, as it did before. Taking the row over already counted one attempt
+        // (see reserve()), so the stored count may equal ours: it then stays, and
+        // only the back-off is applied. A delay is only ever extended, never
+        // shortened, and `attempts` never goes back.
         $this->pdo->prepare(
-            "UPDATE {$this->table} SET payload = :payload, attempts = :attempts,"
+            "UPDATE {$this->table} SET"
+            . ' payload = CASE WHEN attempts < :attempts_a THEN :payload ELSE payload END,'
+            . ' attempts = CASE WHEN attempts < :attempts_b THEN :attempts_c ELSE attempts END,'
             . ' available_at = CASE WHEN available_at > :available_a THEN available_at ELSE :available_b END'
-            . ' WHERE id = :id AND attempts < :attempts_guard',
+            . ' WHERE id = :id AND attempts <= :attempts_guard',
         )->execute([
+            ':attempts_a' => $attempts,
+            ':attempts_b' => $attempts,
+            ':attempts_c' => $attempts,
             ':payload' => $payload,
-            ':attempts' => $attempts,
             ':available_a' => $availableAt,
             ':available_b' => $availableAt,
             ':id' => $id,

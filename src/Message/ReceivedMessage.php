@@ -25,12 +25,17 @@ final class ReceivedMessage implements InboundMessage
      * @param  string  $rawBody  The exact JSON body as received.
      * @param  array<string, mixed>  $envelope  The decoded envelope (may be [] for a malformed body).
      * @param  mixed   $receipt  Opaque ack handle understood only by the originating transport.
+     * @param  bool    $abandoned  True when the transport is handing the message out again after a
+     *         delivery that was never acknowledged, released or dead-lettered (the worker died or
+     *         the reservation lapsed), and has already counted that delivery in the envelope's
+     *         `attempts`. A transport that cannot tell leaves it false.
      */
     public function __construct(
         private readonly string $queue,
         private readonly string $rawBody,
         private readonly array $envelope,
         private readonly mixed $receipt,
+        private readonly bool $abandoned = false,
     ) {}
 
     /**
@@ -112,6 +117,16 @@ final class ReceivedMessage implements InboundMessage
         $attempts = $this->envelope['attempts'] ?? null;
 
         return is_int($attempts) ? $attempts : 0;
+    }
+
+    /**
+     * Whether a previous delivery of this message ended without an outcome (the
+     * worker died mid-handler or its reservation lapsed) and the transport counted
+     * it in {@see attempts()}.
+     */
+    public function wasAbandoned(): bool
+    {
+        return $this->abandoned;
     }
 
     /**

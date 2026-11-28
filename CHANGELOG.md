@@ -4,6 +4,71 @@ All notable changes to `initphp/queue` are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `Contracts\OwnershipAwareIdempotencyStore` (extends `IdempotencyStore`, optional,
+  independent of `CompletionAwareIdempotencyStore`): `claimOwned()` returns a token
+  for the claim it took, `forgetOwned()` releases a claim only while that token
+  still owns the key. The `Dispatcher` uses them when the store implements the
+  interface; a store that does not keeps `claim()` and `forget()` exactly as before.
+  The bundled `InMemoryIdempotencyStore` implements it.
+- `ReceivedMessage` has a new optional last constructor argument `$abandoned` and
+  `wasAbandoned()`: the transport has handed the message out again after a delivery
+  that never ended in an ack, release or dead-letter, and has already counted that
+  delivery in `attempts()`.
+- `RedisTransport` has a new optional last constructor argument `$startedSuffix`
+  (default `:started`).
+
+### Fixed
+
+- **A handler that kills its process now counts as an attempt.** A handler killed by
+  out-of-memory, `exit` or `SIGKILL` never reports a failure, so its message used to
+  come back with the same `attempts` for ever. The transport now counts the
+  unfinished delivery when it hands the message out again, and the `Worker`
+  dead-letters it (reason `failed`) once `attempts` reaches `maxAttempts`, without
+  running the handler again. PDO: a row taken over after its reservation lapsed gets
+  `attempts` (column and envelope) raised in the same `UPDATE` that takes it, so one
+  worker counts it; no schema change. Redis: `reserve()` records each delivery in a
+  `<queue>:started` sorted set (SHA-1 of the body) that `ack()`, `release()` and
+  `deadLetter()` clear, and a body that returns with its entry still there is
+  counted, in the body and in the processing entry, so the count survives the next
+  crash; the body format is unchanged and a client without the sorted-set commands
+  switches the counting off. RabbitMQ: the broker's `redelivered` flag counts one
+  attempt (a classic queue keeps no delivery count, so repeated crashes are not
+  bounded there). Waiting for another handler's in-flight key is a release and is
+  never counted, so `inFlightDelaySeconds` waits still use no attempts.
+- **A handler that outlived its lease no longer deletes the new holder's claim.** On
+  a store that implements `OwnershipAwareIdempotencyStore`, the late failure releases
+  only its own claim, so the claim or completed record of the worker that took over
+  stays.
+- An abandoned message that is out of attempts is checked against the idempotency
+  store before it is dead-lettered: a key recorded as processed drops it as a
+  `duplicate` (the handler finished, only its ack was lost) and a key still claimed
+  releases it as `in_flight`. `Dispatcher::dispatch()` has a new optional second
+  argument, `$exhausted`, for this; the `Worker` passes it. A message that is put
+  back this way is treated as exhausted when it returns: any message that arrives
+  with `attempts` at or above `maxAttempts` and no `dead_letter` block is, so a
+  handler that kills its process every time reaches the dead-letter queue even when
+  `leaseSeconds` is longer than the transport's redelivery time. A store that cannot
+  tell a recorded key from a claimed one now dead-letters such a message instead of
+  discarding it.
+- `RedisTransport` counting never fails a reservation: a `NOPERM`/unknown-command
+  refusal of `ZREMRANGEBYSCORE`, `LINSERT` or the other commands it adds switches the
+  counting off, and any other failure while counting hands the message out
+  uncounted, instead of leaving it on `<queue>:processing`.
+- `PdoTransport::release()` for a worker whose reservation was taken over records
+  the back-off even when the stored `attempts` already equals the one it reports
+  (the take-over counted it); `attempts` still never goes back.
+
+### Notes
+
+- Nothing changes for existing stores, transports or message bodies; see
+  `docs/Idempotent-Consumption.md` (Upgrading from 2.3) for rolling deploys. A
+  handler that outlives `retryAfter` (PDO) or your Redis reaper's delay while its
+  worker is alive looks like a dead one and its second delivery is counted.
+
 ## [2.3.0] - 2026-11-25
 
 ### Added

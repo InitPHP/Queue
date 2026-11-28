@@ -55,6 +55,25 @@ auto_delete=false`); the body is the canonical envelope JSON.
 | `release()` | **Republish** the updated envelope, wait for the broker's confirm if the channel is in confirm mode, then `basic_ack` the original. |
 | `deadLetter()` | Publish the annotated envelope to `<queue>.failed`, wait for the confirm likewise, then `basic_ack` the original. |
 
+### A delivery that was never acked
+
+A message the broker delivers again because its first delivery was never acked (the
+worker died inside the handler, or the channel closed) arrives with the AMQP
+`redelivered` flag. The transport counts that unfinished delivery as one attempt: it
+hands the worker the body with `attempts` raised by one, and the worker dead-letters
+the message when that reaches `maxAttempts`. A retry, a release and a dead-letter
+publish a **new** message, so only a genuinely unfinished delivery carries the flag.
+
+RabbitMQ keeps no delivery count on a classic queue (`x-delivery-count` exists on
+quorum queues only, which this transport's queue declaration does not create), and
+the body of an unacked message cannot be rewritten in place. The raised count is
+therefore not stored: if the handler kills its process again, the redelivered body
+still has the old `attempts` and is counted once more as `+1`, not `+2`. **A handler
+that kills its process on every delivery is not bounded by `maxAttempts` on
+RabbitMQ**; use [PDO](Transport-PDO.md) or [Redis](Transport-Redis.md) when you need
+that bound, or find the message with the broker's own tools. A normal failure
+stores the count, because it republishes.
+
 ### Why retries republish
 
 RabbitMQ does not let you mutate a message body in place, and a plain

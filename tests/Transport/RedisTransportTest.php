@@ -272,6 +272,7 @@ final class RedisTransportTest extends TestCase
         $client->shouldReceive('eval')->once()->andThrow(new ServerException('NOPERM this user has no permissions to run the \'eval\' command'));
         $client->shouldReceive('lrem')->with('orders:processing', 1, 'raw')->once()->andReturn(1);
         $client->shouldReceive('rpush')->with('orders', ['payload'])->once();
+        $client->shouldReceive('zrem')->andReturn(0);
 
         $transport = new RedisTransport($client, 'default');
         $transport->release(new ReceivedMessage('orders', 'raw', [], 'raw'), 'payload', 0);

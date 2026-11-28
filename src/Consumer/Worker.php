@@ -160,7 +160,21 @@ final class Worker
      */
     private function process(ReceivedMessage $message): bool
     {
-        $outcome = $this->dispatcher->dispatch($message);
+        // A message whose earlier delivery ended without an outcome has already had
+        // that delivery counted in `attempts` by the transport. A handler that
+        // kills its process (OOM, `exit`, SIGKILL) never reports a failure, so when
+        // that count reaches `maxAttempts` the dispatcher quarantines the message
+        // instead of running it again for ever (after checking the idempotency
+        // store: a message another handler finished, or still holds, is not failed).
+        // The verdict has to outlive that check: a message put back because its key is
+        // still claimed is no longer "abandoned" when it returns, but it is still out of
+        // attempts. Only the count can bring a live message to `maxAttempts` (a failure
+        // at that count is dead-lettered, never re-queued), so a message that arrives
+        // there without a `dead_letter` block is exhausted too. A replayed dead letter
+        // keeps its block and, as before, runs once more.
+        $exhausted = $message->attempts() >= $this->options->maxAttempts
+            && ($message->wasAbandoned() || ! array_key_exists('dead_letter', $message->envelope()));
+        $outcome = $this->dispatcher->dispatch($message, $exhausted);
 
         switch ($outcome->kind) {
             case OutcomeKind::Ack:

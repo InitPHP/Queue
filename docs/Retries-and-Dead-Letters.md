@@ -25,11 +25,53 @@ The delay between attempts comes from `WorkerOptions::$backoff`
 > (a delayed sorted set). RabbitMQ retries immediately unless you install the
 > delayed-message-exchange plugin — see [Transport: RabbitMQ](Transport-RabbitMQ.md).
 
+## A handler that kills its process
+
+A handler that is killed (out of memory, `exit`, `SIGKILL`) never throws, so the
+worker never learns that it failed. The transport does: the message comes back
+because its reservation lapsed, or the broker or your reaper returned it. A
+delivery that ended without an ack, a release or a dead-letter counts as **one
+attempt**, recorded by the transport before it hands the message out again. If that
+brings `attempts` to `maxAttempts`, the worker dead-letters the message with reason
+`failed` and does not run the handler again.
+
+| Transport | How the unfinished delivery is found | Counted |
+| --------- | ------------------------------------ | ------- |
+| PDO | a row that is still stamped `reserved_at` when its reservation lapses (`retryAfter`) | every one, in the same `UPDATE` that takes the row |
+| Redis | the body is back on the queue while its `<queue>:started` entry is still there | every one, in the body and in the processing entry |
+| RabbitMQ | the broker's `redelivered` flag | **one**: classic queues keep no delivery count and the unacked body cannot be rewritten, so a handler that kills its process on every delivery is counted once, not once per crash |
+
+With [deduplication](Idempotent-Consumption.md) on, the idempotency record is read
+before the message is dead-lettered, so a message is not failed for a handler that
+did finish. If the key is recorded as processed (the handler finished and only its
+ack was lost) the message is acknowledged and discarded as a `duplicate`; if the key
+is still claimed (another handler is running, or a dead one's lease has not lapsed)
+the message is put back as `in_flight`; only a message with neither is dead-lettered.
+A message that is put back this way returns out of attempts: the worker treats any
+message that arrives with `attempts` at or above `maxAttempts` and no `dead_letter`
+block as exhausted, whether or not the transport still marks it as unfinished, so
+the crash loop ends as soon as the dead handler's claim has lapsed, even when
+`leaseSeconds` is longer than `retryAfter`. A store that cannot tell a recorded key
+from a claimed one cannot say whether the handler finished, so the message is
+dead-lettered, never discarded. A [replayed](#replaying-a-dead-lettered-message)
+message that still has its `dead_letter` block runs normally.
+
+A message put back without an outcome of its own, such as one waiting for another
+handler's [in-flight key](Idempotent-Consumption.md), has its reservation cleared by
+`release()` and is not counted, however many times it waits. A normal failure is not
+counted twice either: the unfinished delivery and the failure that follows it are two
+different deliveries.
+
+A handler that outlives `retryAfter` (PDO) or the delay of your Redis reaper while
+its worker is alive looks like a dead one: the second delivery is counted. Keep both
+above your slowest handler.
+
 ## When a message is dead-lettered
 
 | Cause | Reason in the `dead_letter` block |
 | ----- | --------------------------------- |
 | Exhausted retries — a handler kept throwing until `attempts` reached `maxAttempts` | `failed` |
+| Exhausted deliveries — a handler's process died until `attempts` reached `maxAttempts` (see [above](#a-handler-that-kills-its-process)) | `failed` |
 | Malformed / poison envelope (missing URN, non-object `data`, bad `attempts`) | an `EnvelopeValidator::REASON_*` value |
 | Unsupported `meta.schema_version` (a newer producer) — **quarantined, never dropped** | `unsupported_schema_version` |
 | Unknown URN with the `DEAD_LETTER` strategy (or `FAIL` after retries) | `unknown_urn` |

@@ -9,6 +9,7 @@ use BabelQueue\Contracts\Transport;
 use BabelQueue\Transport\AmqpTransport as BabelAmqpTransport;
 use InitPHP\Queue\Contracts\ConsumerTransport;
 use InitPHP\Queue\Exceptions\QueueException;
+use InitPHP\Queue\Message\AbandonedDelivery;
 use InitPHP\Queue\Message\ReceivedMessage;
 use PhpAmqpLib\Channel\AMQPChannel;
 use ReflectionException;
@@ -23,6 +24,13 @@ use ReflectionProperty;
  * `x-schema-version`/`x-source-lang`/`x-attempts` headers), so a non-PHP consumer
  * can route and trace without decoding the body. Consuming pulls one message at a
  * time with `basic_get`; `ack` is `basic_ack` on the delivery tag.
+ *
+ * A message the broker delivers again because its first delivery was never acked
+ * (a worker that died mid-handler) is counted as one failed attempt. RabbitMQ keeps
+ * no delivery count on a classic queue, only a redelivered flag, and the body of the
+ * unacked message cannot be rewritten in place, so the count is not carried across
+ * further crashes: a handler that kills its process on every delivery is counted
+ * once, not once per crash. See docs/Transport-RabbitMQ.md.
  *
  * Because RabbitMQ does not version a message body in place, a retry/dead-letter
  * republishes the updated envelope (so `attempts` and the `dead_letter` block
@@ -72,7 +80,14 @@ final class AmqpTransport implements Transport, ConsumerTransport
 
         $raw = $message->getBody();
 
-        return new ReceivedMessage($queue, $raw, EnvelopeCodec::decode($raw), $message->getDeliveryTag());
+        // The broker marks a message it delivers again after the first delivery was
+        // never acked (the consumer died, or the channel closed mid-handler). That
+        // delivery counts as an attempt. A retry, release or dead-letter publishes a
+        // new message, so only a genuinely unfinished delivery carries the flag.
+        $counted = $message->isRedelivered() === true ? AbandonedDelivery::countedBody($raw) : null;
+        $body = $counted ?? $raw;
+
+        return new ReceivedMessage($queue, $body, EnvelopeCodec::decode($body), $message->getDeliveryTag(), $counted !== null);
     }
 
     public function ack(ReceivedMessage $message): void

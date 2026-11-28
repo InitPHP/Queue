@@ -35,6 +35,7 @@ final class AmqpTransportTest extends TestCase
         $amqpMessage = Mockery::mock(AMQPMessage::class);
         $amqpMessage->shouldReceive('getBody')->andReturn($raw);
         $amqpMessage->shouldReceive('getDeliveryTag')->andReturn(42);
+        $amqpMessage->shouldReceive('isRedelivered')->andReturn(false);
 
         $channel = Mockery::mock(AMQPChannel::class);
         $channel->shouldReceive('queue_declare')->once()->with('orders', false, true, false, false);
@@ -45,6 +46,46 @@ final class AmqpTransportTest extends TestCase
         self::assertInstanceOf(ReceivedMessage::class, $message);
         self::assertSame('urn:babel:orders:created', $message->getUrn());
         self::assertSame(42, $message->receipt());
+    }
+
+    public function test_a_redelivered_message_counts_the_unfinished_delivery_as_an_attempt(): void
+    {
+        $raw = $this->envelope();
+
+        $amqpMessage = Mockery::mock(AMQPMessage::class);
+        $amqpMessage->shouldReceive('getBody')->andReturn($raw);
+        $amqpMessage->shouldReceive('getDeliveryTag')->andReturn(43);
+        $amqpMessage->shouldReceive('isRedelivered')->andReturn(true);
+
+        $channel = Mockery::mock(AMQPChannel::class);
+        $channel->shouldReceive('queue_declare');
+        $channel->shouldReceive('basic_get')->once()->andReturn($amqpMessage);
+
+        $message = (new AmqpTransport($channel, 'default'))->reserve('orders');
+
+        self::assertNotNull($message);
+        self::assertTrue($message->wasAbandoned());
+        self::assertSame(1, $message->attempts());
+        self::assertSame(1, EnvelopeCodec::decode($message->rawBody())['attempts']);
+        self::assertSame(43, $message->receipt(), 'the delivery tag still identifies the broker message');
+    }
+
+    public function test_a_first_delivery_is_not_counted(): void
+    {
+        $amqpMessage = Mockery::mock(AMQPMessage::class);
+        $amqpMessage->shouldReceive('getBody')->andReturn($this->envelope());
+        $amqpMessage->shouldReceive('getDeliveryTag')->andReturn(44);
+        $amqpMessage->shouldReceive('isRedelivered')->andReturn(false);
+
+        $channel = Mockery::mock(AMQPChannel::class);
+        $channel->shouldReceive('queue_declare');
+        $channel->shouldReceive('basic_get')->once()->andReturn($amqpMessage);
+
+        $message = (new AmqpTransport($channel, 'default'))->reserve('orders');
+
+        self::assertNotNull($message);
+        self::assertFalse($message->wasAbandoned());
+        self::assertSame(0, $message->attempts());
     }
 
     public function test_reserve_returns_null_when_no_message_is_waiting(): void

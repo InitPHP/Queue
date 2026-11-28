@@ -359,15 +359,16 @@ final class InFlightRedeliveryTest extends TestCase
         self::assertNotNull($lapsed);
         $pdo->exec("UPDATE jobs SET reserved_at = '2999-01-01 00:00:00'"); // A's stamp differs from B's
 
+        // Taking the lapsed row over counted one attempt already; B's failure is the next.
         $envelope = $lapsed->envelope();
-        $envelope['attempts'] = 1;
+        $envelope['attempts'] = $lapsed->attempts() + 1;
         $b->release($lapsed, EnvelopeCodec::encode($envelope), 60);
 
         $pdo->exec("UPDATE jobs SET reserved_at = '" . date('Y-m-d H:i:s') . "'"); // A's reservation again
         $a->release($held, $held->rawBody(), 5);
 
         $row = $pdo->query('SELECT attempts, available_at FROM jobs')->fetch(PDO::FETCH_ASSOC);
-        self::assertSame(1, (int) $row['attempts']);
+        self::assertSame(2, (int) $row['attempts']);
         self::assertGreaterThan(time() + 30, strtotime((string) $row['available_at']), 'the 60 s back-off was not cut to 5 s');
     }
 
